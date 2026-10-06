@@ -1,0 +1,29 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below, and also cite ESR (Bartlett, Desmond & Ferreira 2023)."
+title: "MIGHTEE_ESR: symbolic regression of dark-matter density profiles from MIGHTEE rotation curves"
+authors:
+  - family-names: Martín
+    given-names: Alicia
+    affiliation: "Department of Physics, University of Oxford"
+repository-code: "https://github.com/Alicia-Martin/MIGHTEE_ESR"
+license: MIT
+version: 0.1.0
+date-released: 2026-10-06
+keywords:
+  - dark matter
+  - rotation curves
+  - symbolic regression
+  - MIGHTEE
+references:
+  - type: article
+    title: "Exhaustive Symbolic Regression"
+    authors:
+      - family-names: Bartlett
+        given-names: Deaglan J.
+      - family-names: Desmond
+        given-names: Harry
+      - family-names: Ferreira
+        given-names: Pedro G.
+    journal: "IEEE Transactions on Evolutionary Computation"
+    year: 2023
+    doi: "10.1109/TEVC.2023.3280250"

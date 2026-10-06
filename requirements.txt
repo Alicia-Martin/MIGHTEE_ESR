@@ -1,0 +1,16 @@
+# Tested with Python 3.11/3.12.
+numpy>=2.0
+scipy>=1.13
+sympy>=1.13
+pandas>=2.2
+matplotlib>=3.9
+astropy>=6.0
+jax>=0.4.30
+numpyro>=0.15
+mpmath
+numdifftools
+prettytable
+tabulate
+corner
+psutil
+mpi4py      # needed for the multi-core fitting stages

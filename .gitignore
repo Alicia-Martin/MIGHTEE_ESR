@@ -1,0 +1,29 @@
+# Data (MIGHTEE catalogues are not public -- see README)
+*.txt
+!requirements.txt
+*.csv
+*.dat
+*.fits
+
+# ESR function library (download separately -- see README)
+/function_library/
+
+# Generated output
+esr/fitting/output*/
+esr/fitting/partial_*/
+/fitting/
+/output*/
+/nfw_fits*/
+/posterior_check_output*/
+*.pdf
+*.png
+
+# Private notes
+NOTES*.md
+
+# OneDrive conflict copies, Python/OS cruft
+*-asmaclap80*
+__pycache__/
+*.pyc
+.DS_Store
+.ipynb_checkpoints/

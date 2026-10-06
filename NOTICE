@@ -1,0 +1,13 @@
+The esr/ directory is a modified copy of ESR (Exhaustive Symbolic Regression),
+https://github.com/DeaglanBartlett/ESR
+
+  Copyright (c) Deaglan Bartlett and Harry Desmond
+  Released under the MIT licence.
+
+  Bartlett, Desmond & Ferreira (2023), "Exhaustive Symbolic Regression",
+  IEEE Transactions on Evolutionary Computation, doi:10.1109/TEVC.2023.3280250
+
+Modifications (the MIGHTEE rotation-curve likelihood in esr/fitting/dm_likelihood.py,
+changes to the fitting, Fisher/description-length, matching and ranking stages, and
+the verification scripts) are Copyright (c) 2026 Alicia Martín, under the MIT licence
+in LICENSE.
