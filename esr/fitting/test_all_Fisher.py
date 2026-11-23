@@ -23,7 +23,13 @@ use_relative_dx = True              # CHANGE
 comm = MPI.COMM_WORLD
 rank = comm.Get_rank()
 size = comm.Get_size()
-    
+
+def galaxy_hessian_len(max_param, fit_ml):
+    """Length of the saved galaxy-Hessian block per function: [fisher_inc, fisher_d,
+    fisher_inc_d, cross_shape_inc (max_param), cross_shape_d (max_param)], followed
+    with fit_ml by [fisher_f, fisher_inc_f, fisher_d_f, cross_shape_f (max_param)]."""
+    return 3 + 2 * max_param + ((3 + max_param) if fit_ml else 0)
+
 def load_loglike(comp, likelihood, data_start, data_end, split=True):
     """Load results of optimisation completed by test_all.py
 
@@ -38,11 +44,11 @@ def load_loglike(comp, likelihood, data_start, data_end, split=True):
         :negloglike (list): list of minimum log-likelihoods
         :params (np.ndarray): list of parameters at maximum likelihood points. Shape = (nfun, nparam).
         :Nconv, Niter, times: as saved by test_all.py.
-        :inc_fit, d_fit, stage2_chi2: stage-2 galaxy-nuisance-parameter results from
-            test_all.py (nan-filled if likelihood.num_galaxy_params == 0).
+        :inc_fit, d_fit, stage2_chi2, f_fit: stage-2 galaxy-nuisance-parameter results from
+            test_all.py (nan-filled if likelihood.num_galaxy_params == 0; f_fit nan without fit_ml).
 
     Column layout of negloglike_comp{comp}.dat (see test_all.py's main()):
-        [chi2, params (max_param_total cols, shape+rho0/rs), Inc, D, stage2_chi2, Nconv, Niter, times]
+        [chi2, params (max_param_total cols, shape+rho0/rs), Inc, D, stage2_chi2, (f if fit_ml), Nconv, Niter, times]
     max_param_total is computed the same deterministic way test_all.py's main() does, rather
     than inferred from file width, so the params/Inc/D/stage2_chi2 columns split unambiguously.
     """
@@ -60,6 +66,8 @@ def load_loglike(comp, likelihood, data_start, data_end, split=True):
     inc_fit = np.atleast_1d(data[:, 1 + max_param_total])
     d_fit = np.atleast_1d(data[:, 1 + max_param_total + 1])
     stage2_chi2 = np.atleast_1d(data[:, 1 + max_param_total + 2])
+    f_fit = (np.atleast_1d(data[:, 1 + max_param_total + 3]) if getattr(likelihood, "fit_ml", False)
+             else np.full(len(negloglike), np.nan))
     Nconv = np.atleast_1d(data[:,-3])
     Niter = np.atleast_1d(data[:,-2])
     times = np.atleast_1d(data[:,-1])
@@ -70,10 +78,11 @@ def load_loglike(comp, likelihood, data_start, data_end, split=True):
         inc_fit = inc_fit[data_start:data_end]
         d_fit = d_fit[data_start:data_end]
         stage2_chi2 = stage2_chi2[data_start:data_end]
+        f_fit = f_fit[data_start:data_end]
         Nconv = Nconv[data_start:data_end]
         Niter = Niter[data_start:data_end]
         times = times[data_start:data_end]
-    return negloglike, params, Nconv, Niter, times, inc_fit, d_fit, stage2_chi2
+    return negloglike, params, Nconv, Niter, times, inc_fit, d_fit, stage2_chi2, f_fit
 
 def _galaxy_param_term(val, fisher_diag_val):
     """MDL codelen contribution for a single galaxy nuisance parameter (Inc or D),
@@ -105,7 +114,7 @@ def galaxy_codelen_from_fisher(inc_ML, d_ML, fisher_inc, fisher_d):
 
 
 def convert_params(fcn_i, eq, integrated, theta_ML, likelihood, negloglike, max_param=4,  max_fun_param = 4,
-                    inc_ML=np.nan, d_ML=np.nan):
+                    inc_ML=np.nan, d_ML=np.nan, f_ML=np.nan):
     """Compute Fisher, correct MLP and find parametric contirbution to description length for single function
     
     Args:
@@ -163,6 +172,8 @@ def convert_params(fcn_i, eq, integrated, theta_ML, likelihood, negloglike, max_
     n_extra = max(0, max_param - max_fun_param)
     nparam = nshape + n_extra
     num_galaxy_params = getattr(likelihood, "num_galaxy_params", 0)
+    fit_ml = getattr(likelihood, "fit_ml", False)
+    galaxy_vals = [inc_ML, d_ML] + ([f_ML] if fit_ml else [])
 
     # Data
     xvar = likelihood.xvar
@@ -196,7 +207,7 @@ def convert_params(fcn_i, eq, integrated, theta_ML, likelihood, negloglike, max_
         Fisher_diag = np.nan
         deriv[:] = np.nan
         codelen = np.nan  # couldn't even build eq_numpy
-        return params, negloglike, deriv, codelen, np.full(3 + 2 * max_param, np.nan), flag_reason
+        return params, negloglike, deriv, codelen, np.full(galaxy_hessian_len(max_param, fit_ml), np.nan), flag_reason
 
     theta_ML_compact_orig = jnp.concatenate(
         [theta_ML[:nshape], theta_ML[max_fun_param:max_fun_param + n_extra]]
@@ -204,7 +215,7 @@ def convert_params(fcn_i, eq, integrated, theta_ML, likelihood, negloglike, max_
     shape_fit_joint = np.asarray(theta_ML_compact_orig, dtype=float)
 
     n_model = shape_fit_joint.shape[0]
-    galaxy_hessian_extra = np.full(3 + 2 * max_param, np.nan)
+    galaxy_hessian_extra = np.full(galaxy_hessian_len(max_param, fit_ml), np.nan)
     if num_galaxy_params == 0:
         Hmat_joint = None
         fisher_inc_out, fisher_d_out = np.nan, np.nan
@@ -212,7 +223,7 @@ def convert_params(fcn_i, eq, integrated, theta_ML, likelihood, negloglike, max_
     else:
         theta_full = jnp.concatenate([
             jnp.atleast_1d(jnp.asarray(shape_fit_joint, dtype=jnp.float64)),
-            jnp.array([inc_ML, d_ML], dtype=jnp.float64),
+            jnp.array(galaxy_vals, dtype=jnp.float64),
         ])
         joint_hessian_template = likelihood.get_loss(eq_numpy, integrated, value='hessian', include_priors=True)
         Hmat_joint = np.asarray(
@@ -227,10 +238,16 @@ def convert_params(fcn_i, eq, integrated, theta_ML, likelihood, negloglike, max_
         galaxy_hessian_extra[2] = float(Hmat_joint[n_model, n_model + 1])
         galaxy_hessian_extra[3:3 + n_model] = Hmat_joint[:n_model, n_model]
         galaxy_hessian_extra[3 + max_param:3 + max_param + n_model] = Hmat_joint[:n_model, n_model + 1]
+        if fit_ml:
+            k = 3 + 2 * max_param
+            galaxy_hessian_extra[k] = float(Hmat_joint[n_model + 2, n_model + 2])
+            galaxy_hessian_extra[k + 1] = float(Hmat_joint[n_model, n_model + 2])
+            galaxy_hessian_extra[k + 2] = float(Hmat_joint[n_model + 1, n_model + 2])
+            galaxy_hessian_extra[k + 3:k + 3 + n_model] = Hmat_joint[:n_model, n_model + 2]
 
     loss_template = likelihood.get_loss(
         eq_numpy, integrated, value='evaluate', include_priors=True,
-        fixed_galaxy_params=(inc_ML, d_ML),
+        fixed_galaxy_params=tuple(galaxy_vals),
     )
     chi2_fcn = likelihood.get_wrapped_like(loss_template)
 
@@ -363,7 +380,18 @@ def convert_params(fcn_i, eq, integrated, theta_ML, likelihood, negloglike, max_
     # main() to write to its own file) and fall through to the same
     # diagonal-only codelen computation CLASH would use instead.
     if Hmat_kept.size > 0:
-        min_eigval = np.min(np.linalg.eigvalsh(Hmat_kept))
+        # Rescale before eigvalsh: finite but extreme entries can make LAPACK
+        # fail to converge. Only the sign of min_eigval matters here, and the
+        # printed value is rescaled back. On failure, flag rather than crash.
+        H_scale = np.max(np.abs(Hmat_kept))
+        try:
+            min_eigval = np.min(np.linalg.eigvalsh(
+                Hmat_kept / H_scale if H_scale > 0 else Hmat_kept
+            )) * (H_scale if H_scale > 0 else 1.0)
+        except np.linalg.LinAlgError:
+            min_eigval = np.nan
+            flag_reason = "eigvalsh did not converge on Hessian after snap-to-zero"
+            print(fcn_i, 'bad Fisher (eigvalsh did not converge) -- flagged, not excluded', flush=True)
         if min_eigval <= 0.:
             flag_reason = f"indefinite Hessian after snap-to-zero (min_eigval={min_eigval:.3e})"
             print(fcn_i, 'bad Fisher (indefinite after snap-to-zero) -- flagged, not excluded', flush=True)
@@ -424,7 +452,7 @@ def main(comp, likelihood, tmax=5, print_frequency=50, try_integration=False, ma
     fcn_list_proc, data_start, data_end = test_all.get_functions(comp, likelihood)
     (
         negloglike, params_proc, Nconv_proc, Niter_proc, times_proc,
-        inc_fit_proc, d_fit_proc, stage2_chi2_proc,
+        inc_fit_proc, d_fit_proc, stage2_chi2_proc, f_fit_proc,
     ) = load_loglike(comp, likelihood, data_start, data_end)
 
     max_param = params_proc.shape[1]
@@ -434,7 +462,8 @@ def main(comp, likelihood, tmax=5, print_frequency=50, try_integration=False, ma
     params = np.zeros([len(fcn_list_proc), max_param])
     deriv = np.zeros([len(fcn_list_proc), int(max_param* (max_param+1) / 2)])
 
-    galaxy_hessian_all = np.full((len(fcn_list_proc), 3 + 2 * max_param), np.nan)
+    galaxy_hessian_all = np.full(
+        (len(fcn_list_proc), galaxy_hessian_len(max_param, getattr(likelihood, "fit_ml", False))), np.nan)
     # Non-scoring plausibility flags (indefinite-after-snap-to-zero, from
     # convert_params) -- same pattern as test_all.py's own flagged_comp{N}.dat:
     # written to its own file below, never fed into codelen/DL.
@@ -456,7 +485,7 @@ def main(comp, likelihood, tmax=5, print_frequency=50, try_integration=False, ma
         params[i,:], negloglike[i], deriv[i,:], codelen[i], galaxy_hessian_all[i,:], flag_reason = convert_params(
             fcn_i, eq, integrated, theta_ML, likelihood, negloglike[i],
             max_param=max_param, max_fun_param=max_fun_params,
-            inc_ML=inc_fit_proc[i], d_ML=d_fit_proc[i],
+            inc_ML=inc_fit_proc[i], d_ML=d_fit_proc[i], f_ML=f_fit_proc[i],
         )
         if flag_reason:
             flagged_rows.append(f"{fcn_i};{flag_reason}")
@@ -502,7 +531,11 @@ def main(comp, likelihood, tmax=5, print_frequency=50, try_integration=False, ma
     #                                             [:max_param], cross_shape_d
     #                                             [:max_param] -- convert_params's
     #                                             galaxy_hessian_extra layout,
-    #                                             unchanged)
+    #                                             unchanged; with fit_ml followed
+    #                                             by fisher_f, fisher_inc_f,
+    #                                             fisher_d_f, cross_shape_f
+    #                                             [:max_param], see
+    #                                             galaxy_hessian_len)
     # Kept in one file (rather than a separate galaxy_fisher_comp{N}.dat)
     # since the two blocks are always written together, always the same
     # length, and always keyed by the same row -- see convert_params's own

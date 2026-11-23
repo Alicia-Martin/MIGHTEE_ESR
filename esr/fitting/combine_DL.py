@@ -64,7 +64,7 @@ def main(comp, likelihood, print_frequency=1000):
 
     # match.py's codelen_matches_comp{comp}.dat column layout:
     # [negloglike, codelen, index, params(max_param_total), Deltas(max_param_total),
-    #  Inc, D, Nconv, Niter, times]
+    #  Inc, D, (f if fit_ml), Nconv, Niter, times]
     # Computed explicitly (matching test_all.py/test_all_Fisher.py's own formula)
     # rather than inferred from file width via a fragile [:,3:-3] slice --
     # that slice previously (silently, pre-dating this round's Inc/D work)
@@ -76,6 +76,7 @@ def main(comp, likelihood, print_frequency=1000):
     n_extra = 2 if getattr(likelihood, "use_physical_scale", False) else 0
     max_param_total = max_param_shape + n_extra
     num_galaxy_params = getattr(likelihood, "num_galaxy_params", 0)
+    fit_ml = getattr(likelihood, "fit_ml", False)
 
     data = np.genfromtxt(likelihood.out_dir + "/codelen_matches_comp"+str(comp)+".dat") # All
     data = np.atleast_2d(data)
@@ -85,6 +86,7 @@ def main(comp, likelihood, print_frequency=1000):
     params = data[:, 3:3 + max_param_total]
     inc_col = data[:, 3 + 2 * max_param_total]
     d_col = data[:, 3 + 2 * max_param_total + 1]
+    f_col = data[:, 3 + 2 * max_param_total + 2] if fit_ml else np.full(len(data), np.nan)
     Nconv = data[:,-3]
     Niter = data[:,-2]
     time = data[:, -1]
@@ -105,6 +107,7 @@ def main(comp, likelihood, print_frequency=1000):
     params_min = np.zeros((len(fcn_list_proc), params.shape[1]))  # These are all now specific to the proc
     inc_min = np.full(len(fcn_list_proc), np.nan)
     d_min = np.full(len(fcn_list_proc), np.nan)
+    f_min = np.full(len(fcn_list_proc), np.nan)
 
     fcn_min = [None] * len(fcn_list_proc)
     negloglike_min = np.zeros(len(fcn_list_proc))
@@ -132,6 +135,7 @@ def main(comp, likelihood, print_frequency=1000):
         params_i = params[index==xarr_proc[i], :]
         inc_i = inc_col[index==xarr_proc[i]]
         d_i = d_col[index==xarr_proc[i]]
+        f_i = f_col[index==xarr_proc[i]]
         DL = negloglike_i + codelen_i + aifeyn_i
         # print(DL)
 
@@ -146,6 +150,7 @@ def main(comp, likelihood, print_frequency=1000):
         params_min[i,:] = params_i[np.nanargmin(DL),:]
         inc_min[i] = inc_i[np.nanargmin(DL)]
         d_min[i] = d_i[np.nanargmin(DL)]
+        f_min[i] = f_i[np.nanargmin(DL)]
         fcn_min[i] = fcn_list_all_i[np.nanargmin(DL)]
         
         negloglike_min[i] = negloglike_i[np.nanargmin(DL)]
@@ -157,13 +162,14 @@ def main(comp, likelihood, print_frequency=1000):
 
         print(fcn_min[i], negloglike_min[i], codelen_min[i])
 
-    # [DL_min, params_min(max_param_total), Inc, D, negloglike_min, codelen_min,
+    # [DL_min, params_min(max_param_total), Inc, D, (f if fit_ml), negloglike_min, codelen_min,
     #  aifeyn_min, Nconv_min, Niter_min, time_min] -- Inc/D inserted right after
     # params_min; the trailing 6-column block's relative order/composition is
     # unchanged from before, so the negative-index reload below still works.
     out_arr = np.transpose(np.vstack(
         [DL_min] + [params_min[:,i] for i in range(params_min.shape[1])]
         + [inc_min, d_min]
+        + ([f_min] if fit_ml else [])
         + [negloglike_min, codelen_min, aifeyn_min] + [Nconv_min, Niter_min, time_min]
     ))
     prefix = likelihood.combineDL_prefix
@@ -192,6 +198,7 @@ def main(comp, likelihood, print_frequency=1000):
         params_min = data[:,1:1+params.shape[1]]
         inc_min = data[:, 1 + params.shape[1]]
         d_min = data[:, 1 + params.shape[1] + 1]
+        f_min = data[:, 1 + params.shape[1] + 2] if fit_ml else np.full(len(data), np.nan)
         negloglike_min = data[:,-6]
         codelen_min = data[:,-5]
         aifeyn_min = data[:,-4]
@@ -203,6 +210,7 @@ def main(comp, likelihood, print_frequency=1000):
         params_min = np.atleast_2d(params_min)
         inc_min = np.atleast_1d(inc_min)
         d_min = np.atleast_1d(d_min)
+        f_min = np.atleast_1d(f_min)
         negloglike_min = np.atleast_1d(negloglike_min)
         codelen_min = np.atleast_1d(codelen_min)
         aifeyn_min = np.atleast_1d(aifeyn_min)
@@ -230,6 +238,7 @@ def main(comp, likelihood, print_frequency=1000):
             params_sort = params_min[indices_sort,:]
             inc_sort = inc_min[indices_sort]
             d_sort = d_min[indices_sort]
+            f_sort = f_min[indices_sort]
             fcn_min_sort = [fcn_min[i] for i in indices_sort]
 
             negloglike_sort = negloglike_min[indices_sort]
@@ -249,6 +258,7 @@ def main(comp, likelihood, print_frequency=1000):
             time_sort = []
             inc_sort = []
             d_sort = []
+            f_sort = []
 
 
         if os.path.exists(likelihood.out_dir + '/'+likelihood.final_prefix+str(comp)+'.dat'):           # Start this file from scratch here
@@ -279,6 +289,8 @@ def main(comp, likelihood, print_frequency=1000):
         # specific attributes that don't exist here; removed).
         if num_galaxy_params != 0:
             names += ["Inc", "D"]
+        if fit_ml:
+            names += ["f_ml"]
 
         #Time and other things
         names += ["Nconv", "Niter", "Time"]
@@ -294,6 +306,8 @@ def main(comp, likelihood, print_frequency=1000):
                 row_data += ['%.2e'%params_sort[i,j] for j in range(params.shape[1])]
                 if num_galaxy_params != 0:
                     row_data += [_fmt_bounded(inc_sort[i]), _fmt_bounded(d_sort[i])]
+                if fit_ml:
+                    row_data += [_fmt_bounded(f_sort[i])]
                 row_data += ['%.2f'%Nconv_sort[i], '%.2f'%Niter_sort[i], '%.2f'%time_sort[i]]
 
                 # Add the row to the table
@@ -302,6 +316,8 @@ def main(comp, likelihood, print_frequency=1000):
             csv_row = [i, fcn_min_sort[i], DL_sort[i], Prel[i], negloglike_sort[i], codelen_sort[i], aifeyn_sort[i]] + [params_sort[i,j] for j in range(params.shape[1])]
             if num_galaxy_params != 0:
                 csv_row += [inc_sort[i], d_sort[i]]
+            if fit_ml:
+                csv_row += [f_sort[i]]
             with open(likelihood.out_dir + '/'+likelihood.final_prefix+str(comp)+'.dat', 'a') as f:
                 writer = csv.writer(f, delimiter=';')
                 writer.writerow(csv_row)

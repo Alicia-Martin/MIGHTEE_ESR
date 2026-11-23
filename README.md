@@ -30,15 +30,28 @@ For each galaxy and complexity (number of nodes in the function tree):
 
 The physics is in `esr/fitting/dm_likelihood.py` (`MIGHTEELikelihood`). It predicts
 `v_circ(r)` from the dark-matter profile plus the baryonic contribution, with priors on
-inclination and distance. [`PIPELINE_EXPLAINED.md`](PIPELINE_EXPLAINED.md) walks through
+inclination and distance. With `--fit-ml` it also fits a stellar mass-to-light factor
+`f` that scales the stellar velocity contribution, `v_bar² = f v_star² + v_gas²`, with a
+Gaussian prior centred on 1 whose width comes from each galaxy's SED-based M/L
+uncertainty. [`PIPELINE_EXPLAINED.md`](PIPELINE_EXPLAINED.md) walks through
 each stage in detail, including the non-obvious numerical behaviour.
 
 Further analysis:
 
 - `combine_all_galaxies.py`, `combine_across_comp_global.py`: population-level
   rankings across galaxies and complexities.
+- `summarize_global_top.py`: de-duplicated cross-complexity ranking, with the top
+  functions' rotation curves, density profiles and parameter distributions.
+- `pareto_plot_mightee.py`: Pareto front (description length and -log L against
+  complexity) with the standard profiles overplotted.
 - `fit_standard_profiles.py`, `fit_nfw_all_galaxies.py`: fits of standard profiles
-  (NFW, etc.) for comparison.
+  (NFW, Burkert, pseudo-isothermal, etc.) with the same likelihood, for comparison.
+- `screen_global_local.py`, `nested_global_local.py`: global/local parameter scheme.
+  The screen bounds how much sharing a subset of shape parameters across all galaxies
+  could lower the population DL; the nested fit refits the promising candidates.
+- `plot_inc_vs_fml.py`: fitted M/L factor against fitted inclination, per galaxy.
+- `postprocess_mightee_glamdring.sh`: runs the combination and all plots for one run as
+  a single cluster job.
 - `prepare_posterior_hmc_meta.py`, `run_posterior_hmc_single.py`,
   `merge_posterior_hmc.py`, `plot_posterior_hmc.py`: HMC (NumPyro NUTS) posteriors for
   the top functions.
@@ -75,6 +88,20 @@ python run_esr_mightee.py --galaxy <NAME> --comp 5 --data-file <catalogue.txt>
 COMP=5 PYTHON_BIN=$(which python3) bash submit_mightee_comp_glamdring.sh
 ```
 
+Options:
+
+- `--fit-ml` (or `FIT_ML=1` for the submit script) also fits the M/L factor `f`.
+  Results go to a separate `<run>_fml` folder.
+- `--no-physical-scale` (or `USE_PHYSICAL_SCALE=0`) fits the shape `f(r)` directly,
+  without `rho0` and `rs`.
+- `--start-from fisher|match|combine` (or `START_FROM=...`) reruns only the later stages
+  from the files already written.
+
+The fitting stage saves a checkpoint every 200 functions per MPI rank. A job resubmitted
+with the same number of cores resumes from the last checkpoint. Functions already
+present, with identical text, at a lower complexity are not refitted
+(`ESR_SKIP_PREVIOUS=0` turns this off).
+
 Results are written to `fitting/output/output_<run>/<galaxy>/comp<N>/`. The final
 ranking is in `results_pretty_<N>.txt`.
 
@@ -93,6 +120,11 @@ with one row per radial point and these columns:
 | `v_circ` | observed circular velocity (km/s) |
 | `v_rot_err_lo`, `v_rot_err_hi` | asymmetric velocity uncertainties |
 | `v_bar_total`, `v_bar_total_err` | baryonic velocity contribution and uncertainty |
+
+With `--fit-ml` the table also needs a `Vstar` column (stellar velocity contribution at
+f = 1), and a file `RAR_MIGHTEE_total_ml_ratios_direct.txt` next to the catalogue with
+columns `galaxy`, `ML_Ks_16`, `ML_Ks_50`, `ML_Ks_84` (the M/L posterior percentiles that
+set the width of the prior on `f`).
 
 Any rotation-curve sample in this format can be used.
 

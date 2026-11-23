@@ -10,6 +10,10 @@ import esr.fitting.combine_DL as combine_DL
 
 from esr.fitting.dm_likelihood import MIGHTEELikelihood
 
+STAGES = ["test_all", "fisher", "match", "combine"]
+
+DATA_FILE = "ALL_gbar_gobs_RAR_direct_phot_with_5_arc_radius_plus_Halpha_for_ESR.txt"
+
 
 def run_mightee_pipeline_for_galaxy(
     galaxy_name,
@@ -22,9 +26,12 @@ def run_mightee_pipeline_for_galaxy(
     method="DIRECT",
     use_physical_scale=True,
     fn_library_dir=None,
+    start_from="test_all",
+    fit_ml=False,
 ):
     """
-    Run:
+    Run (from `start_from` onwards, so a crash in a later stage can be resumed
+    without redoing the earlier ones):
       1) test_all
       2) test_all_Fisher
       3) match
@@ -33,16 +40,21 @@ def run_mightee_pipeline_for_galaxy(
     for a single MIGHTEE galaxy.
     """
 
-    likelihood = MIGHTEELikelihood(data_file=data_file, name=galaxy_name, run_name=run_name, data_dir=os.getcwd(), fn_set=fn_set, use_physical_scale=use_physical_scale, fn_library_dir=fn_library_dir,)
+    likelihood = MIGHTEELikelihood(data_file=data_file, name=galaxy_name, run_name=run_name, data_dir=os.getcwd(), fn_set=fn_set, use_physical_scale=use_physical_scale, fn_library_dir=fn_library_dir, fit_ml=fit_ml,)
 
-    print(f"Running test_all for {galaxy_name} ...")
-    test_all.main(comp, likelihood, tmax=60, try_integration=try_integration, log_opt=log_opt, method=method,)
+    stage = STAGES.index(start_from)
 
-    print(f"Running test_all_Fisher for {galaxy_name} ...")
-    test_all_Fisher.main(comp, likelihood, tmax=5, try_integration=try_integration,)
+    if stage <= 0:
+        print(f"Running test_all for {galaxy_name} ...")
+        test_all.main(comp, likelihood, tmax=60, try_integration=try_integration, log_opt=log_opt, method=method,)
 
-    print(f"Running match for {galaxy_name} ...")
-    match.main( comp, likelihood, tmax=5, try_integration=try_integration,)
+    if stage <= 1:
+        print(f"Running test_all_Fisher for {galaxy_name} ...")
+        test_all_Fisher.main(comp, likelihood, tmax=5, try_integration=try_integration,)
+
+    if stage <= 2:
+        print(f"Running match for {galaxy_name} ...")
+        match.main( comp, likelihood, tmax=5, try_integration=try_integration,)
 
     print(f"Running combine_DL for {galaxy_name} ...")
     combine_DL.main(comp, likelihood)
@@ -114,10 +126,12 @@ def _parse_args():
                      "(see submit_mightee_comp.sh) as well as for local runs."
     )
     p.add_argument("--galaxy", required=True, help="Galaxy name, must match the "
-                    "'Galaxy' column in --data-file.")
+                    "'Galaxy' column in --data-file (see galaxy_names.txt).")
     p.add_argument("--comp", required=True, type=int, help="Complexity to run.")
-    p.add_argument("--data-file", default="ALL_gbar_gobs_RAR_direct_phot.txt",
-                    help="Rotation-curve catalogue (see README for the expected columns).")
+    p.add_argument("--data-file", default=DATA_FILE,
+                    help="Authoritative catalog by default -- do not point this at "
+                         "rar_with_ml_direct_phot.csv or its _filtered variant, both "
+                         "superseded (see README.md).")
     p.add_argument("--run-name", default="mightee", help="Base run name; the actual "
                     "run_name used is '{run-name}_rho{True|False}/{galaxy}/comp{comp}', "
                     "matching run_mightee_pipeline_all_galaxies's own nesting so output "
@@ -125,6 +139,9 @@ def _parse_args():
                     "galaxy, with each comp nested inside it as output_{run-name}_"
                     "rho{True|False}/{galaxy}/comp{comp}/, instead of a separate "
                     "top-level folder per (galaxy, comp) pair.")
+    p.add_argument("--fit-ml", action="store_true", help="Fit the stellar M/L factor f "
+                    "as a third galaxy parameter (prior from RAR_MIGHTEE_total_ml_ratios_direct.txt). "
+                    "Adds '_fml' to the run name so outputs never mix with runs without f.")
     p.add_argument("--fn-set", default="core_maths")
     p.add_argument("--method", default="DIRECT")
     p.add_argument("--log-opt", dest="log_opt", action="store_true", default=True)
@@ -149,13 +166,17 @@ def _parse_args():
                     "output) under its output directory. Without this flag, an "
                     "already-done galaxy is skipped -- lets a resubmitted array job "
                     "not re-burn allocation on finished galaxies.")
+    p.add_argument("--start-from", choices=STAGES, default="test_all",
+                    help="Resume at this stage, reusing the earlier stages' output "
+                         "files already in this galaxy/comp's output directory.")
     return p.parse_args()
 
 
 if __name__ == "__main__":
     args = _parse_args()
     rho_tag = "rhoTrue" if args.use_physical_scale else "rhoFalse"
-    run_name = f"{args.run_name}_{rho_tag}/{args.galaxy}/comp{args.comp}"
+    base_run_name = f"{args.run_name}_fml" if args.fit_ml else args.run_name
+    run_name = f"{base_run_name}_{rho_tag}/{args.galaxy}/comp{args.comp}"
 
     # Mirrors likelihood.py's own out_dir construction (like_dir = data_dir/fitting/,
     # out_dir = like_dir/output/output_{run_name}), since combine_DL.py writes
@@ -179,4 +200,6 @@ if __name__ == "__main__":
             method=args.method,
             use_physical_scale=args.use_physical_scale,
             fn_library_dir=args.fn_library_dir,
+            start_from=args.start_from,
+            fit_ml=args.fit_ml,
         )

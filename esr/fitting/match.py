@@ -25,6 +25,32 @@ comm = MPI.COMM_WORLD
 rank = comm.Get_rank()
 size = comm.Get_size()
 
+# Snapping options (compute_function_codelen):
+#  SNAP_ALL_SUBSETS: every subset of the non-zero shape params may be pinned to 0, not
+#      only those with Nsteps < 1 (a measured but unnecessary param can then be dropped).
+#  SNAP_REFIT: each pinned subset is tried both as is and with every remaining active
+#      param (shape, rho0/rs, Inc/D) refit.
+#  SNAP_RECOMPUTE_DELTA: Delta is recomputed (Fisher at the candidate point, integral
+#      fallback) for every candidate, instead of keeping the pre-snap Delta of the
+#      surviving params.
+# Default "legacy" (all three off) = the ESR rule: a param is set to 0 only when it cannot
+# be encoded (Delta > |p|, i.e. its encoded value is 0), and the others are sent at their
+# fitted values (no refit). "full" (ESR_SNAP_MODE=full) turns snapping into a per-galaxy
+# choice among f and its sub-functions: those already have their own (lower-complexity)
+# rows, and summed over galaxies each galaxy would pick a sub-model without paying for the
+# choice. Kept only as an option.
+SNAP_MAXITER = 2000
+
+
+def set_snap_mode(mode):
+    """'legacy' (default: ESR rule) or 'full' (all subsets, refit, Delta recomputed)."""
+    global SNAP_ALL_SUBSETS, SNAP_REFIT, SNAP_RECOMPUTE_DELTA
+    on = {"legacy": False, "full": True}[mode]
+    SNAP_ALL_SUBSETS = SNAP_REFIT = SNAP_RECOMPUTE_DELTA = on
+
+
+set_snap_mode(os.environ.get("ESR_SNAP_MODE", "legacy"))
+
 
 def build_layout(nshape, max_fun_params=4, n_extra=0):
     """Return indices for the shape block, padding, extra physical params, and active params."""
@@ -112,7 +138,7 @@ def codelen_from_vector(p, Delta, active_idx):
 
 
 def get_sigma_from_integral(p, Sigma, fop, negloglike_all, active_idx, fcn_i="", number_points=10**3,
-                             boundaries_out=None):
+                             boundaries_out=None, fop_batch=None):
     """Estimate per-parameter sigma by integrating the 1D likelihood along each active direction.
 
     boundaries_out: optional dict, populated in-place as
@@ -148,6 +174,17 @@ def get_sigma_from_integral(p, Sigma, fop, negloglike_all, active_idx, fcn_i="",
     p = np.asarray(p, dtype=float)
     Sigma = np.asarray(Sigma, dtype=float)
     active_idx = np.asarray(active_idx, dtype=int)
+    # fop on a batch of points (rows): one compiled call for a whole grid
+    # instead of one Python-level fop call per grid point.
+    # Callers looping over many points pass their own (compiled once).
+    if fop_batch is None:
+        fop_batch = jax.jit(vmap(fop))
+
+    def batch_nll(Q):
+        try:
+            return np.asarray(fop_batch(jnp.asarray(Q, dtype=float)), dtype=float)
+        except Exception:
+            return np.array([float(fop(q)) for q in Q])
 
     def signed_gap(x, pvec, j, factor):
         """deltaNLL - log(1e3) at step 10**x in direction `factor`; +inf
@@ -175,23 +212,38 @@ def get_sigma_from_integral(p, Sigma, fop, negloglike_all, active_idx, fcn_i="",
         return 10**x at the first sign change of signed_gap (refined by
         brentq), or None if signed_gap never crosses zero in range.
         """
+        # Steps relative to |theta| (from 1e-20 |theta| upwards), not from an
+        # absolute 1e-12: for a parameter with |theta| << 1e-12 an absolute first
+        # step would already be far outside the peak on both sides.
         x_hi = max(np.log10(theta_abs) + 4.0, 6.0)
-        x_grid = np.linspace(-12.0, x_hi, n_grid)
-        prev_x, prev_g = x_grid[0], signed_gap(x_grid[0], pvec, j, factor)
-        if prev_g >= 0:
-            # Already past target at the smallest step -- no valid bracket
-            # (this direction's deltaNLL doesn't start below the target).
+        x_grid = np.linspace(np.log10(theta_abs) - 20.0, x_hi, n_grid)
+        with np.errstate(over="ignore"):
+            steps = factor * 10.0 ** x_grid
+        Q = np.tile(np.asarray(pvec, dtype=float), (n_grid, 1))
+        Q[:, j] = Q[:, j] + steps
+        v = batch_nll(Q)
+        gaps = np.where(np.isfinite(v) & np.isfinite(steps), v - negloglike_all - np.log(1e3), 1e6)
+        if gaps[0] >= 0:
+            # Already past target (in practice: invalid) at the smallest step,
+            # i.e. a hard cutoff AT the ML value (a parameter on the edge of
+            # its domain). This side holds no probability mass: boundary 0,
+            # and the other side alone sets Sigma. Returning None here made
+            # Sigma=inf (Delta=|theta|, log 2 only) however well the other
+            # side measures the parameter.
+            return 0.0
+        hit = np.where(gaps >= 0)[0]
+        if len(hit) == 0:
             return None
-        for x in x_grid[1:]:
-            g = signed_gap(x, pvec, j, factor)
-            if g >= 0:
-                root_x = brentq(signed_gap, prev_x, x, args=(pvec, j, factor), xtol=1e-6)
-                return 10.0 ** root_x
-            prev_x, prev_g = x, g
-        return None
+        k = hit[0]
+        # The batched and the scalar fop can disagree right at a kink/cutoff, so the
+        # scalar ends may not bracket; then the grid point itself is the boundary.
+        if not (signed_gap(x_grid[k - 1], pvec, j, factor) < 0 <= signed_gap(x_grid[k], pvec, j, factor)):
+            return 10.0 ** x_grid[k]
+        root_x = brentq(signed_gap, x_grid[k - 1], x_grid[k], args=(pvec, j, factor), xtol=1e-6)
+        return 10.0 ** root_x
 
-    def compute_like(theta_vec):
-        return jnp.exp(-fop(theta_vec) + negloglike_all)
+    def compute_like(thetas):
+        return np.exp(-batch_nll(thetas) + negloglike_all)
 
     def get_integral(theta, boundary_left, boundary_right, param, number_points=5 * 10**2):
         """Cumulative probability mass in the symmetric interval
@@ -217,7 +269,7 @@ def get_sigma_from_integral(p, Sigma, fop, negloglike_all, active_idx, fcn_i="",
         a_range_left = np.linspace(theta, theta - boundary_left, number_points)
         thetas_left = np.tile(param, (len(a_range_left), 1))
         thetas_left[:, j] = a_range_left
-        like_left = np.asarray(vmap(compute_like)(thetas_left), dtype=float)
+        like_left = compute_like(thetas_left)
         # cumtrapz over decreasing x yields a negative-growing array; negate
         # so mass_left(d) is a positive, increasing function of distance d.
         mass_left = -safe_cumtrapz(like_left, a_range_left)
@@ -226,7 +278,7 @@ def get_sigma_from_integral(p, Sigma, fop, negloglike_all, active_idx, fcn_i="",
         a_range_right = np.linspace(theta, theta + boundary_right, number_points)
         thetas_right = np.tile(param, (len(a_range_right), 1))
         thetas_right[:, j] = a_range_right
-        like_right = np.asarray(vmap(compute_like)(thetas_right), dtype=float)
+        like_right = compute_like(thetas_right)
         mass_right = safe_cumtrapz(like_right, a_range_right)
         d_right = a_range_right - theta
 
@@ -261,7 +313,7 @@ def get_sigma_from_integral(p, Sigma, fop, negloglike_all, active_idx, fcn_i="",
         if boundaries_out is not None:
             boundaries_out[int(j)] = (boundary_left, boundary_right)
 
-        if boundary_left is None or boundary_right is None:
+        if boundary_left is None or boundary_right is None or (boundary_left == 0 and boundary_right == 0):
             print(f"Couldn't find integral limits for function {fcn_i}, parameter {theta}", flush=True)
             Sigma[j] = np.inf
             continue
@@ -284,7 +336,7 @@ def compute_function_codelen(
     shape_idx, extra_idx, active_idx, pad_idx,
     fop, negloglike_at_p, number_points=10**3,
     galaxy_idx=None, inc_d_cache=None, cache_key=None,
-    stats=None,
+    stats=None, hess_fn=None,
 ):
     """
     Full production codelen for one function at one already-fitted point,
@@ -295,7 +347,8 @@ def compute_function_codelen(
     unresolved/oversized entry (see codelen_from_vector's own docstring for
     why -- an uncapped oversized Delta gives log(|theta|/Delta) < 0, an
     unbounded-negative-codelen pathology), then a snap-vs-no-snap
-    combinatorial exploration over shape parameters.
+    combinatorial exploration over shape parameters (SNAP_* flags above:
+    every subset, with and without refit, Delta recomputed per candidate).
 
     Inc and D are NOT a special case here -- the caller folds them into
     extra_idx/active_idx (and into p/fish_mat) exactly like rho0/rs, so
@@ -359,10 +412,171 @@ def compute_function_codelen(
     found a lower-DL snapped combination (shape parameters only -- Inc/D,
     like rho0/rs, are never snap-eligible). negloglike_final is exactly
     fop() at the returned p_final -- no term added or removed.
+
+        hess_fn: optional callable q -> joint Hessian of fop at the padded
+            vector q (len(p) x len(p)), used to recompute Delta at every snap
+            candidate (see SNAP_* at the top of this file). Defaults to a
+            numdifftools Hessian of fop (_fd_hessian).
     """
     p = np.asarray(p, dtype=float).copy()
     active_idx = np.asarray(active_idx, dtype=int)
+    shape_idx = np.asarray(shape_idx, dtype=int)
+    fop_batch = jax.jit(vmap(fop))  # compiled only if an integral fallback runs
+    if hess_fn is None:
+        def hess_fn(q):
+            return _fd_hessian(fop, q, active_idx)
+
+    def fop_safe(q):
+        try:
+            v = float(fop(np.asarray(q, dtype=float)))
+        except Exception:
+            return np.inf
+        return v if np.isfinite(v) else np.inf
+
+    def total_at(q, H, nll, live_idx, use_cache):
+        """codelen and nll + codelen of point q (Hessian H) over the params live_idx."""
+        Delta = _deltas_at(
+            q, H, live_idx, extra_idx, fop, nll, fcn_i, number_points,
+            galaxy_idx=galaxy_idx if use_cache else None,
+            inc_d_cache=inc_d_cache if use_cache else None,
+            cache_key=cache_key, stats=stats if use_cache else None, fop_batch=fop_batch,
+        )
+        # Unresolved (inf) or oversized Delta -> |theta|: never a discount for being
+        # worse than one step (see codelen_from_vector).
+        Dc = np.where(np.isfinite(Delta) & (Delta > 0), Delta, np.abs(q))
+        Dc = np.minimum(Dc, np.abs(q))
+        code = codelen_from_vector(q, Dc, active_idx)
+        return code, nll + code, Dc
+
+    code0, total0, Dc0 = total_at(p, fish_mat, negloglike_at_p, active_idx, True)
+    best = (total0, code0, float(negloglike_at_p), p, Dc0)
+
+    free_shape = [int(j) for j in shape_idx if j < len(p) and p[j] != 0]
+    if SNAP_ALL_SUBSETS:
+        snap_pool = free_shape
+    else:  # ESR rule: only params measured to less than one step
+        snap_pool = [j for j in free_shape if not (Dc0[j] < abs(p[j]))]
+
+    if snap_pool and (SNAP_REFIT or SNAP_RECOMPUTE_DELTA):
+        # The snap candidates, their refits and their integral fallbacks call fop
+        # thousands of times; un-jitted each call costs ~3 ms of JAX dispatch,
+        # jitted ~20 us. Same function, so the same values.
+        try:
+            _fop_jit = jax.jit(fop)
+            if not np.isclose(float(_fop_jit(p)), float(fop(p)), rtol=1e-10, atol=1e-10, equal_nan=True):
+                raise ValueError("jitted fop disagrees")
+            fop = _fop_jit
+            fop_batch = jax.jit(vmap(fop))
+        except Exception:
+            pass
+
+    for r in range(1, len(snap_pool) + 1):
+        for S in itertools.combinations(snap_pool, r):
+            live = np.array([j for j in active_idx if j not in S], dtype=int)
+            q0 = p.copy()
+            q0[list(S)] = 0.0
+            cands = [q0]
+            if SNAP_REFIT:
+                cands.append(_refit_live(fop_safe, q0, [j for j in live if q0[j] != 0]))
+            for q in cands:
+                nll = fop_safe(q)
+                if not np.isfinite(nll):
+                    continue
+                if SNAP_RECOMPUTE_DELTA:
+                    try:
+                        H = hess_fn(q)
+                    except Exception:
+                        H = np.full((len(q), len(q)), np.nan)
+                    code, total, Dc = total_at(q, H, nll, live, False)
+                else:  # ESR rule: the surviving params keep their pre-snap Delta
+                    Dc = Dc0.copy()
+                    code = codelen_from_vector(q, Dc, active_idx)
+                    total = nll + code
+                if np.isfinite(total) and total < best[0] - 1e-8:
+                    best = (total, code, nll, q, Dc)
+
+    _, codelen_total, negloglike_final, p, Delta_capped = best
+    p = np.array(p, dtype=float)
+    Delta_capped = np.array(Delta_capped, dtype=float)
+    for j in range(len(p)):
+        if p[j] == 0:
+            Delta_capped[j] = 0.0
+    if len(pad_idx) > 0:
+        p[pad_idx] = 0.0
+        Delta_capped[pad_idx] = 0.0
+
+    return float(codelen_total), float(negloglike_final), p, Delta_capped
+
+
+def _fd_hessian(fop, q, idx):
+    """Hessian of fop at q over the non-zero params idx (numdifftools, adaptive steps
+    relative to each |q_j|); the other rows/columns are nan. Used at the snap
+    candidates instead of a jax.hessian, whose compile (~3 s) dominated per row."""
+    import numdifftools as nd
+    q = np.asarray(q, dtype=float)
+    live = [int(j) for j in idx if q[j] != 0]
+    H = np.full((len(q), len(q)), np.nan)
+    if not live:
+        return H
+    scale = q[live]
+
+    def g(u):
+        qq = q.copy()
+        qq[live] = scale * (1.0 + u)
+        return float(fop(qq))
+
+    try:
+        Hu = np.asarray(nd.Hessian(g)(np.zeros(len(live))), dtype=float).reshape(len(live), len(live))
+    except Exception:
+        return H
+    H[np.ix_(live, live)] = Hu / np.outer(scale, scale)
+    return H
+
+
+def _refit_live(fop_safe, q0, live):
+    """Minimise fop over the params `live` (all non-zero), the rest held at q0.
+
+    Done in sign*exp(x) coordinates, so rho0 ~ 1e7 and Inc ~ 50 get comparable steps;
+    Nelder-Mead from a simplex of factor e^0.5 per param. Returns q0 if nothing better
+    is found -- an under-converged refit only makes a snap candidate look worse.
+    """
+    live = [int(j) for j in live]
+    if not live:
+        return q0
+    sgn = np.sign(q0[live])
+    x0 = np.log(np.abs(q0[live]))
+
+    def obj(x):
+        q = q0.copy()
+        q[live] = sgn * np.exp(x)
+        return min(fop_safe(q), 1e30)
+
+    simplex = np.vstack([x0] + [x0 + 0.5 * np.eye(len(live))[k] for k in range(len(live))])
+    try:
+        res = scipy.optimize.minimize(
+            obj, x0, method="Nelder-Mead",
+            options={"initial_simplex": simplex, "maxiter": SNAP_MAXITER * len(live),
+                     "xatol": 1e-7, "fatol": 1e-9},
+        )
+    except Exception:
+        return q0
+    if not (np.isfinite(res.fun) and res.fun < obj(x0)):
+        return q0
+    q = q0.copy()
+    q[live] = sgn * np.exp(res.x)
+    return q
+
+
+def _deltas_at(p, fish_mat, active_idx, extra_idx, fop, negloglike_at_p, fcn_i, number_points,
+               galaxy_idx=None, inc_d_cache=None, cache_key=None, stats=None, fop_batch=None):
+    """Delta_j = sqrt(12) Sigma_j for the params active_idx at point p (inf if unresolved).
+
+    Sigma_j = 1/sqrt(F_jj); for params with F_jj <= 0 or taking part in a negative
+    eigenvalue of the joint Fisher, the 1D integral fallback get_sigma_from_integral.
+    """
     max_param_total = len(p)
+    active_idx = np.asarray(active_idx, dtype=int)
+    fish_mat = np.asarray(fish_mat, dtype=float)
     diag_fish = np.diag(fish_mat)
 
     Sigma = np.full(max_param_total, np.inf, dtype=float)
@@ -390,11 +604,23 @@ def compute_function_codelen(
             # conservatively fall back to marking the whole block, as before.
             bad_participation[:] = True
         else:
-            eigvals_active, eigvecs_active = np.linalg.eigh(fish_active)
-            tol = 1e-8 * np.max(np.abs(eigvals_active))
-            eigenvector_weight_tol = 1e-6
-            for be in np.where(eigvals_active < -tol)[0]:
-                bad_participation |= np.abs(eigvecs_active[:, be]) > eigenvector_weight_tol
+            # Test the CORRELATION matrix R = F_ij / sqrt(F_ii F_jj), not F: the params
+            # differ in scale by up to ~1e14 in F (rho0 ~ 1e7 vs Inc ~ 50), so with F
+            # (or F / max|F|) a saddle along rho0/rs has an eigenvalue far below any
+            # tolerance relative to the Inc/D ones and went undetected. R's
+            # eigenvalues are O(1) whatever the units. Params with F_jj <= 0 keep
+            # scale 1 (their Sigma is already inf).
+            d = np.abs(np.diag(fish_active))
+            s = np.where(d > 0, 1.0 / np.sqrt(np.where(d > 0, d, 1.0)), 1.0)
+            try:
+                eigvals_active, eigvecs_active = np.linalg.eigh(fish_active * np.outer(s, s))
+            except np.linalg.LinAlgError:
+                bad_participation[:] = True
+            else:
+                tol = 1e-8 * np.max(np.abs(eigvals_active))
+                eigenvector_weight_tol = 1e-6
+                for be in np.where(eigvals_active < -tol)[0]:
+                    bad_participation |= np.abs(eigvecs_active[:, be]) > eigenvector_weight_tol
     if np.any(bad_participation):
         bad_active_idx = active_idx[bad_participation]
         # A fresh indefiniteness finding for THIS row overrides any cached
@@ -407,12 +633,12 @@ def compute_function_codelen(
     if check_idx.size > 0 and np.any(
         (Sigma[check_idx] <= 0) | np.isinf(Sigma[check_idx]) | np.isnan(Sigma[check_idx])
     ):
-        print(f"{fcn_i}: Fisher unusable for param idx {check_idx.tolist()}, running integral fallback", flush=True)
         if stats is not None:
+            print(f"{fcn_i}: Fisher unusable for param idx {check_idx.tolist()}, running integral fallback", flush=True)
             stats['n_integral_fallback'] = stats.get('n_integral_fallback', 0) + 1
         Sigma = get_sigma_from_integral(
             p, Sigma, fop, negloglike_at_p, active_idx=check_idx,
-            fcn_i=fcn_i, number_points=number_points,
+            fcn_i=fcn_i, number_points=number_points, fop_batch=fop_batch,
         )
         Sigma[np.isnan(Sigma)] = np.inf
 
@@ -421,83 +647,10 @@ def compute_function_codelen(
             float(Sigma[gi]) for gi in galaxy_idx if gi < len(Sigma)
         )
 
-    Delta = np.zeros(max_param_total, dtype=float)
+    Delta = np.full(max_param_total, np.inf, dtype=float)
     finite = np.isfinite(Sigma) & (Sigma > 0)
     Delta[finite] = np.sqrt(12.0) * Sigma[finite]
-    Delta[~finite] = np.inf
-
-    if len(extra_idx) > 0:
-        Delta[extra_idx] = np.where(Delta[extra_idx] == 0, np.abs(p[extra_idx]), Delta[extra_idx])
-
-    p_orig = p.copy()
-    Delta_orig = Delta.copy()
-
-    def _snap_eligible(j):
-        d = Delta[j]
-        if not np.isfinite(d):
-            return True
-        if d <= 0:
-            return False
-        return (np.abs(p[j]) / d) < 1
-
-    snap_idx = np.array(
-        [j for j in shape_idx if j < len(p) and _snap_eligible(j)], dtype=int
-    )
-    extra_unresolved_idx = np.array(
-        [j for j in extra_idx if j < len(p) and _snap_eligible(j)], dtype=int
-    )
-
-    Delta_capped = Delta_orig.copy()
-    for _j in snap_idx:
-        Delta_capped[_j] = np.abs(p_orig[_j])
-    for _j in extra_unresolved_idx:
-        Delta_capped[_j] = np.abs(p_orig[_j])
-
-    def eval_total(p_candidate):
-        try:
-            neglog = float(fop(np.asarray(p_candidate, dtype=float)))
-            if not np.isfinite(neglog):
-                return np.inf, np.inf, np.inf
-            code = codelen_from_vector(p_candidate, Delta_capped, active_idx)
-            return neglog, code, neglog + code
-        except Exception as e:
-            print(f"match.py: eval_total failed for {fcn_i} on candidate "
-                  f"{p_candidate}: {type(e).__name__}: {e}", flush=True)
-            return np.inf, np.inf, np.inf
-
-    if len(snap_idx) > 0:
-        best_p = p_orig.copy()
-        best_neglog, best_code, best_total = eval_total(best_p)
-
-        p_snap_all = p_orig.copy()
-        p_snap_all[snap_idx] = 0.0
-        neglog_snap_all, code_snap_all, total_snap_all = eval_total(p_snap_all)
-        if np.isfinite(total_snap_all) and total_snap_all < best_total - 1e-8:
-            best_p = p_snap_all
-            best_neglog, best_code, best_total = neglog_snap_all, code_snap_all, total_snap_all
-
-        if len(snap_idx) > 1:
-            for r in range(len(snap_idx) - 1, 0, -1):
-                for idx_comb in itertools.combinations(snap_idx, r):
-                    p_trial = p_orig.copy()
-                    p_trial[list(idx_comb)] = 0.0
-                    neglog_trial, code_trial, total_trial = eval_total(p_trial)
-                    if np.isfinite(total_trial) and total_trial < best_total - 1e-8:
-                        best_p = p_trial
-                        best_neglog, best_code, best_total = neglog_trial, code_trial, total_trial
-
-        p = best_p
-        negloglike_final = best_neglog
-        codelen_total = best_code
-    else:
-        negloglike_final = negloglike_at_p
-        codelen_total = codelen_from_vector(p, Delta_capped, active_idx)
-
-    if len(pad_idx) > 0:
-        p[pad_idx] = 0.0
-        Delta_capped[pad_idx] = 0.0
-
-    return float(codelen_total), float(negloglike_final), p, Delta_capped
+    return Delta
 
 
 def get_functions(comp, likelihood, unique=True):
@@ -543,12 +696,20 @@ def get_functions(comp, likelihood, unique=True):
 # -----------------------------------------------------------------------------
 # Main matching routine
 # -----------------------------------------------------------------------------
-def main(comp, likelihood, tmax=5, print_frequency=1000, try_integration=False):
+def main(comp, likelihood, tmax=5, print_frequency=1000, try_integration=False,
+         only_rows=None, out_suffix=""):
     """
     Match the fitted functions and compute Fisher-based description lengths.
 
     Parameter ordering is always:
         [shape params up to 4 | padding to 4 | rho0, rs]
+
+    only_rows / out_suffix (re-scoring selected rows, e.g. with
+    set_snap_mode("full")): only the rows (all_equations indices) in only_rows are
+    recomputed; every other row is copied from the existing
+    codelen_matches_comp{comp}.dat, and the result is written to
+    codelen_matches_comp{comp}{out_suffix}.dat (same shape and columns), leaving
+    the original file untouched.
     """
     if likelihood.is_mse:
         raise ValueError("Cannot use MSE with description length")
@@ -566,10 +727,15 @@ def main(comp, likelihood, tmax=5, print_frequency=1000, try_integration=False):
 
     fcn_list_proc, data_start, data_end = test_all.get_functions(comp, likelihood, unique=False)
 
-    fcn_list_unique, _, _ = test_all.get_functions(comp, likelihood, unique=True)
+    # The FULL unique list, not get_functions(unique=True): that returns only
+    # this rank's slice, but `index` below (matches_proc[i]) is a global
+    # unique-function index, so with >1 MPI rank the slice would give the
+    # wrong canonical function.
+    with open(likelihood.fn_dir + "/compl_%i/unique_equations_%i.txt" % (comp, comp)) as f:
+        fcn_list_unique = f.readlines()
     (
         negloglike, params_meas, Nconv, Niter, times,
-        inc_fit, d_fit, stage2_chi2,
+        inc_fit, d_fit, stage2_chi2, f_fit,
     ) = test_all_Fisher.load_loglike(
         comp, likelihood, data_start, data_end, split=False
     )
@@ -578,6 +744,7 @@ def main(comp, likelihood, tmax=5, print_frequency=1000, try_integration=False):
     max_fun_params = 4
     use_physical_scale = getattr(likelihood, "use_physical_scale", False)
     n_extra = 2 if use_physical_scale else 0
+    fit_ml = getattr(likelihood, "fit_ml", False)
 
     all_inv_subs_proc = simplifier.load_subs(invsubs_file, max_param_total)[data_start:data_end]
     matches_proc = np.atleast_1d(np.loadtxt(match_file).astype(int))[data_start:data_end]
@@ -613,6 +780,7 @@ def main(comp, likelihood, tmax=5, print_frequency=1000, try_integration=False):
     Deltas = np.zeros([len(fcn_list_proc), max_param_total])
     inc_fit_all = np.full(len(fcn_list_proc), np.nan)
     d_fit_all = np.full(len(fcn_list_proc), np.nan)
+    f_fit_all = np.full(len(fcn_list_proc), np.nan)
 
     _joint_polish_cache = {}
 
@@ -631,11 +799,33 @@ def main(comp, likelihood, tmax=5, print_frequency=1000, try_integration=False):
             _f_inc, _f_d = all_galaxy_fisher[_idx, 0], all_galaxy_fisher[_idx, 1]
             _sigma_inc = 1.0 / np.sqrt(_f_inc) if (np.isfinite(_f_inc) and _f_inc > 0) else np.inf
             _sigma_d = 1.0 / np.sqrt(_f_d) if (np.isfinite(_f_d) and _f_d > 0) else np.inf
-            _inc_d_sigma_cache[_idx] = (_sigma_inc, _sigma_d)
+            if fit_ml:
+                _f_f = all_galaxy_fisher[_idx, 3 + 2 * max_param_total]
+                _sigma_f = 1.0 / np.sqrt(_f_f) if (np.isfinite(_f_f) and _f_f > 0) else np.inf
+                _inc_d_sigma_cache[_idx] = (_sigma_inc, _sigma_d, _sigma_f)
+            else:
+                _inc_d_sigma_cache[_idx] = (_sigma_inc, _sigma_d)
 
+    previous = None
+    if only_rows is not None:
+        only_rows = set(int(r) for r in only_rows)
+        previous = np.atleast_2d(np.loadtxt(likelihood.out_dir + "/codelen_matches_comp" + str(comp) + ".dat"))
+
+    n_skipped_5param = 0
     for i in range(len(fcn_list_proc)):
         if rank == 0 and ((i == 0) or ((i + 1) % print_frequency == 0)):
             print(f"{i + 1} of {len(fcn_list_proc)}", flush=True)
+
+        if previous is not None and (data_start + i) not in only_rows:
+            row = previous[data_start + i]
+            negloglike_all[i], codelen[i], index_arr[i] = row[0], row[1], row[2]
+            params[i, :] = row[3:3 + max_param_total]
+            Deltas[i, :] = row[3 + max_param_total:3 + 2 * max_param_total]
+            inc_fit_all[i], d_fit_all[i] = row[3 + 2 * max_param_total], row[4 + 2 * max_param_total]
+            if fit_ml:
+                f_fit_all[i] = row[5 + 2 * max_param_total]
+            Nconv_all[i], Niter_all[i], times_all[i] = row[-3:]
+            continue
 
         fcn_i = fcn_list_proc[i].replace("'", "")
 
@@ -650,9 +840,21 @@ def main(comp, likelihood, tmax=5, print_frequency=1000, try_integration=False):
         times_all[i] = times[index]
         inc_fit_all[i] = inc_fit[index]
         d_fit_all[i] = d_fit[index]
+        f_fit_all[i] = f_fit[index]
 
         if np.isnan(negloglike[index]) or np.isinf(negloglike[index]):
             codelen[i] = np.nan
+            continue
+
+        # A representation written with a 5th+ shape parameter (e.g.
+        # 'a0 + a1 + a2 + a3 + a4', a way of writing a0 at comp 9) can't be
+        # handled with max_fun_params = 4. Its canonical (<= 4 params) form is
+        # matched by its own row, and the extra unconstrained parameters only
+        # lengthen the code, so it can never be the best representation: skip
+        # it like a failed fit (codelen = NaN).
+        if any(f"a{k}" in fcn_i for k in range(max_fun_params, 10)):
+            codelen[i] = np.nan
+            n_skipped_5param += 1
             continue
 
         full_cache_key = (fcn_i, int(index))
@@ -675,16 +877,17 @@ def main(comp, likelihood, tmax=5, print_frequency=1000, try_integration=False):
                 measured_canonical[max_fun_params:max_fun_params + n_extra],
             ])
             inc_fit_joint, d_fit_joint = inc_fit[index], d_fit[index]
-            _joint_polish_cache[index] = (shape_fit_joint, inc_fit_joint, d_fit_joint, canonical_nshape)
+            galaxy_vals_joint = [inc_fit_joint, d_fit_joint] + ([f_fit[index]] if fit_ml else [])
+            _joint_polish_cache[index] = (shape_fit_joint, galaxy_vals_joint, canonical_nshape)
 
-        shape_fit_joint, inc_fit_joint, d_fit_joint, canonical_nshape = _joint_polish_cache[index]
+        shape_fit_joint, galaxy_vals_joint, canonical_nshape = _joint_polish_cache[index]
 
         fcn_i, eq, integrated = likelihood.run_sympify(fcn_i, tmax=tmax, try_integration=try_integration)
         eq_numpy = make_lambdified_eq(eq, nshape)
 
         loss_template = likelihood.get_loss(
             eq_numpy, integrated, value="evaluate", include_priors=True,
-            fixed_galaxy_params=(inc_fit_joint, d_fit_joint),
+            fixed_galaxy_params=tuple(galaxy_vals_joint),
         )
         chi2_fcn = likelihood.get_wrapped_like(loss_template)
 
@@ -769,7 +972,7 @@ def main(comp, likelihood, tmax=5, print_frequency=1000, try_integration=False):
             galaxy_idx = np.arange(max_param_total, max_param_total + num_galaxy_params)
             extra_idx_ext = np.concatenate([extra_idx, galaxy_idx]).astype(int)
             active_idx_ext = np.concatenate([shape_idx, extra_idx_ext]).astype(int)
-            p_ext = np.concatenate([p, [inc_fit_joint, d_fit_joint]])
+            p_ext = np.concatenate([p, galaxy_vals_joint])
 
             # Build this row's own FULL [shape, extra, Inc, D] Hessian via a
             # cheap linear (Jacobian congruence) transform of the CANONICAL
@@ -814,7 +1017,8 @@ def main(comp, likelihood, tmax=5, print_frequency=1000, try_integration=False):
                     padded_combo_idx = np.concatenate([padded_shape_idx, padded_extra_idx]).astype(int)
                     compact_combo_idx = np.concatenate([compact_shape_idx, compact_extra_idx]).astype(int)
 
-                    Hmat_canon_full = np.zeros((n_model_compact + 2, n_model_compact + 2))
+                    n_gal = num_galaxy_params
+                    Hmat_canon_full = np.zeros((n_model_compact + n_gal, n_model_compact + n_gal))
                     Hmat_canon_full[np.ix_(compact_combo_idx, compact_combo_idx)] = (
                         fish_mat[np.ix_(padded_combo_idx, padded_combo_idx)]
                     )
@@ -833,7 +1037,18 @@ def main(comp, likelihood, tmax=5, print_frequency=1000, try_integration=False):
                     Hmat_canon_full[inc_pos, d_pos] = fisher_inc_d_canon
                     Hmat_canon_full[d_pos, inc_pos] = fisher_inc_d_canon
 
-                    Jinv_full = np.eye(n_model_compact + 2)
+                    if fit_ml:
+                        # f block, saved after the Inc/D block (test_all_Fisher.galaxy_hessian_len)
+                        k = 3 + 2 * max_param_total
+                        f_pos = n_model_compact + 2
+                        cross_f = galaxy_row[k + 3:k + 3 + n_model_compact]
+                        Hmat_canon_full[compact_combo_idx, f_pos] = cross_f
+                        Hmat_canon_full[f_pos, compact_combo_idx] = cross_f
+                        Hmat_canon_full[f_pos, f_pos] = galaxy_row[k]
+                        Hmat_canon_full[inc_pos, f_pos] = Hmat_canon_full[f_pos, inc_pos] = galaxy_row[k + 1]
+                        Hmat_canon_full[d_pos, f_pos] = Hmat_canon_full[f_pos, d_pos] = galaxy_row[k + 2]
+
+                    Jinv_full = np.eye(n_model_compact + n_gal)
                     if canonical_nshape > 0:
                         Jinv_full[:canonical_nshape, :canonical_nshape] = jinv_shape
 
@@ -894,6 +1109,8 @@ def main(comp, likelihood, tmax=5, print_frequency=1000, try_integration=False):
 
     print(f"rank {rank}: {_fallback_stats['n_integral_fallback']} of {len(fcn_list_proc)} rows "
           f"hit the integral fallback (get_sigma_from_integral) for at least one parameter", flush=True)
+    print(f"rank {rank}: skipped {n_skipped_5param} rows written with a 5th+ shape parameter "
+          f"(codelen = NaN; their <= 4-parameter form has its own row)", flush=True)
 
     fcn_list_proc = np.array(fcn_list_proc)
     print(fcn_list_proc[np.argwhere(codelen == np.inf)])
@@ -904,12 +1121,13 @@ def main(comp, likelihood, tmax=5, print_frequency=1000, try_integration=False):
         + [params[:, i] for i in range(max_param_total)]
         + [Deltas[:, i] for i in range(max_param_total)]
         + [inc_fit_all, d_fit_all]
+        + ([f_fit_all] if fit_ml else [])
         + [Nconv_all, Niter_all, times_all]
     )
     out_arr = np.transpose(out_arr)
 
     np.savetxt(
-        likelihood.temp_dir + "/codelen_matches_" + str(comp) + "_" + str(rank) + ".dat",
+        likelihood.temp_dir + "/codelen_matches_" + str(comp) + out_suffix + "_" + str(rank) + ".dat",
         out_arr,
         fmt="%.7e",
     )
@@ -921,15 +1139,15 @@ def main(comp, likelihood, tmax=5, print_frequency=1000, try_integration=False):
             "cat `find "
             + likelihood.temp_dir
             + '/ -name "codelen_matches_'
-            + str(comp)
+            + str(comp) + out_suffix
             + '_*.dat" | sort -V` > '
             + likelihood.out_dir
             + "/codelen_matches_comp"
-            + str(comp)
+            + str(comp) + out_suffix
             + ".dat"
         )
         os.system(string)
-        string = "rm " + likelihood.temp_dir + "/codelen_matches_" + str(comp) + "_*.dat"
+        string = "rm " + likelihood.temp_dir + "/codelen_matches_" + str(comp) + out_suffix + "_*.dat"
         os.system(string)
 
     comm.Barrier()

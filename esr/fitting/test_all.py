@@ -37,8 +37,8 @@ except ImportError:
 # simplification artifact, not a meaningful physical density profile --
 # oo**a0 is 0 for any a0<0, 1 at a0=0, infinite for a0>0: a genuine
 # step-function likelihood surface with no usable gradient anywhere except
-# a measure-zero point, and its second-derivative autodiff is separately
-# broken -- see the development notes (not included) for the full investigation). Matched on
+# a measure-zero point, and its second-derivative autodiff is not usable
+# either). Matched on
 # word boundaries so this can't accidentally hit a real identifier that
 # merely contains "oo"/"nan" as a substring (none exist in this function
 # library's alphabet, but the boundary costs nothing and removes any risk).
@@ -231,7 +231,7 @@ def lambdify_equation(eq, nshape):
         return _always_inf
 
 
-def galaxy_params_polish(likelihood, eq_numpy, integrated, active_params):
+def galaxy_params_polish(likelihood, eq_numpy, integrated, active_params, f_seeds=(1.0,)):
     """
     Stage-2 unbounded joint polish over [active_params (from stage 1,
     compact shape+rho0/rs vector), Inc, D]. Every candidate function in the
@@ -266,7 +266,12 @@ def galaxy_params_polish(likelihood, eq_numpy, integrated, active_params):
     true global optimum, but multi-seed agreement is a much stronger
     practical signal than any single seed's result on its own.
 
-    Returns (shape_fit, inc_fit, d_fit, stage2_chi2). shape_fit is the
+    With likelihood.fit_ml, the stellar M/L factor f is polished jointly with
+    Inc and D, starting from each of f_seeds (default: its prior mean f = 1
+    only; the extra f-seeded stage 1 adds its own f, see stage1_f_seed).
+
+    Returns (shape_fit, inc_fit, d_fit, stage2_chi2, f_fit), f_fit nan without
+    fit_ml. shape_fit is the
     jointly-optimized shape+rho0/rs vector this polish actually landed on
     (same compact/unpadded format as the input active_params). Callers
     needing self-consistent galaxy Fisher/codelen must use shape_fit here,
@@ -300,25 +305,28 @@ def galaxy_params_polish(likelihood, eq_numpy, integrated, active_params):
     # Fixed Inc seeds: catalog mean, plus 45 and 80 degrees (see this
     # function's docstring for why these three).
     inc_seeds = sorted(set([float(likelihood.inc_true), 45.0, 80.0]))
+    fit_ml = getattr(likelihood, "fit_ml", False)
 
     best_res = None
     for inc0 in inc_seeds:
-        x0 = np.concatenate([active_params, [inc0, likelihood.distance_true]])
-        res = scipy_minimize(obj, x0, method="Nelder-Mead", options={"maxiter": 500})
-        if best_res is None or (np.isfinite(res.fun) and res.fun < best_res.fun):
-            best_res = res
+        for f0 in (list(dict.fromkeys(float(f) for f in f_seeds)) if fit_ml else [None]):
+            x0 = np.concatenate([active_params, [inc0, likelihood.distance_true] + ([f0] if fit_ml else [])])
+            res = scipy_minimize(obj, x0, method="Nelder-Mead", options={"maxiter": 500})
+            if best_res is None or (np.isfinite(res.fun) and res.fun < best_res.fun):
+                best_res = res
 
     n_model = len(active_params)
     shape_fit = np.asarray(best_res.x[:n_model], dtype=float)
     inc_fit = float(best_res.x[n_model])
     d_fit = float(best_res.x[n_model + 1])
     stage2_chi2 = float(best_res.fun)
-    return shape_fit, inc_fit, d_fit, stage2_chi2
+    f_fit = float(best_res.x[n_model + 2]) if fit_ml else np.nan
+    return shape_fit, inc_fit, d_fit, stage2_chi2, f_fit
 
 
 def check_fit_plausibility(likelihood, eq_numpy, integrated, model_params, inc_fit, d_fit,
                             dm_frac_threshold=0.05, inc_boundary_margin=1.0,
-                            d_sigma_threshold=5.0):
+                            d_sigma_threshold=5.0, f_fit=np.nan):
     """
     Post-hoc, non-scoring plausibility check on a function's finished stage-2
     fit -- diagnostic only, never affects chi2/codelen/DL. Flags a
@@ -348,6 +356,7 @@ def check_fit_plausibility(likelihood, eq_numpy, integrated, model_params, inc_f
         _, dm_v2, baryon_v2 = likelihood.get_pred(
             likelihood.xvar, model_params, eq_numpy, integrated=integrated,
             D=d_fit, Inc=inc_fit, return_components=True,
+            f_ml=f_fit if getattr(likelihood, "fit_ml", False) else None,
         )
         dm_v2 = np.asarray(dm_v2, dtype=float)
         baryon_v2 = np.asarray(baryon_v2, dtype=float)
@@ -374,7 +383,7 @@ def check_fit_plausibility(likelihood, eq_numpy, integrated, model_params, inc_f
 # -----------------------------------------------------------------------------
 # DIRECT + Nelder-Mead optimiser
 # -----------------------------------------------------------------------------
-def optimise_fun_direct_nm(
+def _optimise_fun_direct_nm_once(
     fcn_i,
     likelihood,
     tmax,
@@ -431,6 +440,13 @@ def optimise_fun_direct_nm(
     # suffix.
     fcn_index=None,
     fcn_total=None,
+    # Inc held fixed during stage 1 (DIRECT + polish), D at catalog. None =
+    # catalog Inc, the original behaviour. See optimise_fun_direct_nm.
+    stage1_inc=None,
+    # fit_ml only: f held fixed at this value during stage 1 (None = f = 1,
+    # the original behaviour), and stage 2 also starts f from it. See
+    # stage1_f_seed.
+    stage1_f=None,
 ):
     """
     Optimise one function by:
@@ -486,8 +502,15 @@ def optimise_fun_direct_nm(
         integrated,
         value="evaluate",
         include_priors=False,
+        fixed_galaxy_params=(
+            None if stage1_inc is None and stage1_f is None else
+            (float(likelihood.inc_true if stage1_inc is None else stage1_inc),
+             float(likelihood.distance_true))
+            + (() if stage1_f is None else (float(stage1_f),))
+        ),
     )
     wrapped_eval = likelihood.get_wrapped_like(loss_eval)
+    f_seeds = (1.0,) if stage1_f is None else (1.0, float(stage1_f))
 
     # Differentiable version of the same internal (log-magnitude + sign)
     # coordinates, for a BFGS polish alongside Nelder-Mead. On some
@@ -526,16 +549,16 @@ def optimise_fun_direct_nm(
         )
         num_galaxy_params = getattr(likelihood, "num_galaxy_params", 0)
         if num_galaxy_params > 0:
-            _shape_fit, inc_fit, d_fit, stage2_chi2 = galaxy_params_polish(
-                likelihood, eq_numpy, integrated, np.array([])
+            _shape_fit, inc_fit, d_fit, stage2_chi2, f_fit = galaxy_params_polish(
+                likelihood, eq_numpy, integrated, np.array([]), f_seeds=f_seeds
             )
         else:
-            inc_fit, d_fit, stage2_chi2 = np.nan, np.nan, np.nan
+            inc_fit, d_fit, stage2_chi2, f_fit = np.nan, np.nan, np.nan, np.nan
         flag_reason = check_fit_plausibility(
-            likelihood, eq_numpy, integrated, np.array([]), inc_fit, d_fit,
+            likelihood, eq_numpy, integrated, np.array([]), inc_fit, d_fit, f_fit=f_fit,
         )
         return (float(val), np.zeros(nparam_out), 0, 0, True,
-                inc_fit, d_fit, stage2_chi2, flag_reason)
+                inc_fit, d_fit, stage2_chi2, flag_reason, f_fit)
 
     # DIRECT bounds in internal coordinates
     bounds = make_direct_bounds(
@@ -772,7 +795,7 @@ def optimise_fun_direct_nm(
         # No sensible fitted shape/Inc/D to check plausibility of here --
         # chi2=inf already signals this function failed outright.
         return (np.inf, np.zeros(nparam_out), 0, 0, False,
-                inc_fit, d_fit, stage2_chi2, "")
+                inc_fit, d_fit, stage2_chi2, "", 1.0 if getattr(likelihood, "fit_ml", False) else np.nan)
 
     # ---- convert back to physical params ----
     # Whether sign*10**x conversion is needed is decided by best_signs being
@@ -832,12 +855,12 @@ def optimise_fun_direct_nm(
         # which is the whole point of carrying more than one through.
         best_stage2 = None
         for k, cand_params in enumerate(shape_candidates):
-            _sf, _inc, _d, _s2chi2 = galaxy_params_polish(
-                likelihood, eq_numpy, integrated, cand_params
+            _sf, _inc, _d, _s2chi2, _f = galaxy_params_polish(
+                likelihood, eq_numpy, integrated, cand_params, f_seeds=f_seeds
             )
             if best_stage2 is None or (np.isfinite(_s2chi2) and _s2chi2 < best_stage2[3]):
-                best_stage2 = (_sf, _inc, _d, _s2chi2, k)
-        _shape_fit, inc_fit, d_fit, stage2_chi2, winning_k = best_stage2
+                best_stage2 = (_sf, _inc, _d, _s2chi2, k, _f)
+        _shape_fit, inc_fit, d_fit, stage2_chi2, winning_k, f_fit = best_stage2
 
         # shape_fit (stage 2's own joint-optimum output) is saved directly
         # and unconditionally, not the pre-polish shape_candidates[winning_k]
@@ -860,12 +883,14 @@ def optimise_fun_direct_nm(
         print(
             f"    stage 2: Inc fit={inc_fit:.4f} (catalog {likelihood.inc_true:.4f}), "
             f"D fit={d_fit:.4f} (catalog {likelihood.distance_true:.4f}), "
-            f"stage2_chi2={stage2_chi2:.6f} (winning shape candidate "
+            + (f"f_ml fit={f_fit:.4f} (prior 1 +/- {likelihood.sigma_frac_ml:.4f}), "
+               if getattr(likelihood, "fit_ml", False) else "")
+            + f"stage2_chi2={stage2_chi2:.6f} (winning shape candidate "
             f"{winning_k+1}/{len(shape_candidates)})",
             flush=True,
         )
     else:
-        inc_fit, d_fit, stage2_chi2 = np.nan, np.nan, np.nan
+        inc_fit, d_fit, stage2_chi2, f_fit = np.nan, np.nan, np.nan, np.nan
 
     # full_params/chi2_i here are whatever will actually be returned/saved --
     # shape_fit (stage 2's joint-optimum output) if num_galaxy_params > 0,
@@ -900,11 +925,112 @@ def optimise_fun_direct_nm(
         })
 
     flag_reason = check_fit_plausibility(
-        likelihood, eq_numpy, integrated, active_params, inc_fit, d_fit,
+        likelihood, eq_numpy, integrated, active_params, inc_fit, d_fit, f_fit=f_fit,
     )
 
     return (chi2_i, full_params, j_out, count_lowest, success,
-            inc_fit, d_fit, stage2_chi2, flag_reason)
+            inc_fit, d_fit, stage2_chi2, flag_reason, f_fit)
+
+
+# main(): save this rank's partial results every CHECKPOINT_EVERY functions
+# (resumed automatically on restart), and clear JAX's compile cache after each
+# function (memory otherwise grows with every function fitted).
+CHECKPOINT_EVERY = int(os.environ.get("ESR_CHECKPOINT_EVERY", 200))
+CLEAR_JAX_CACHES = os.environ.get("ESR_CLEAR_JAX_CACHES", "1") != "0"
+SKIP_PREVIOUS_EQNS = os.environ.get("ESR_SKIP_PREVIOUS", "1") != "0"
+
+
+# Extra stage-1 inclinations for galaxies where the catalogue baryons exceed
+# the observed velocity. "req": only the Inc at which v_bar <= v_obs at every
+# radius; "req+sigma": also catalog Inc - 1 and - 2 sigma; None: off.
+STAGE1_INC_MODE = "req"
+
+
+def stage1_inc_seeds(likelihood, mode=STAGE1_INC_MODE):
+    """Extra fixed inclinations for stage 1, or [] when not needed.
+
+    Stage 1 fits the shape with Inc at the catalogue value. If v_bar > v_obs
+    somewhere at that Inc, any dark matter makes the fit worse there, so
+    stage 1 drives the DM to ~0 (rho0 rs^2 ~ 1e-10). Stage 2 then polishes
+    rho0/rs in linear units from that point, where -logL is flat over many
+    decades, and only lowers Inc -- it cannot find the joint optimum with
+    lower Inc AND substantial DM (MGTH_J095717.1+020853, 1/(x**2 + x):
+    -logL 27.6 stored vs 19.8 true). Seeding stage 1 at an Inc where the
+    baryons fit under the data lets it find the DM-on basin.
+    """
+    if not mode or getattr(likelihood, "num_galaxy_params", 0) == 0:
+        return []
+    v = np.asarray(likelihood.yvar, dtype=float)
+    vb = np.asarray(likelihood.v_bar, dtype=float)
+    if not np.any(vb > v):
+        return []
+    inc0, sig = float(likelihood.inc_true), float(likelihood.e_inc)
+    ratio = float(np.min(v[vb > 0] / vb[vb > 0]))
+    inc_req = float(np.degrees(np.arcsin(np.clip(np.sin(np.radians(inc0)) * ratio, 0.0, 1.0))))
+    seeds = [inc_req]
+    if mode == "req+sigma":
+        seeds += [inc0 - sig, inc0 - 2.0 * sig]
+    out = []
+    for s in seeds:
+        s = float(np.clip(s, 1.0, 89.0))
+        if abs(s - inc0) > 0.5 and all(abs(s - t) > 0.5 for t in out):
+            out.append(s)
+    return out
+
+
+def stage1_f_seed(likelihood, mode=STAGE1_INC_MODE):
+    """fit_ml only: the f at which v_bar <= v_obs at every radius with Inc and
+    D at their catalogue values, or None when not needed / not possible.
+
+    The f counterpart of stage1_inc_seeds: with f free, the baryons can be
+    brought under the data either by lowering Inc or by lowering f
+    (v_bar^2 = f v_star^2 + v_gas^2). Seeding only the low-Inc way would
+    miss a DM-on basin at the catalogue Inc with lower f, which can cost
+    less prior (galaxies with a narrow f prior vs a broad Inc prior).
+        f_req = min over radii with v_star > 0 of (v_obs^2 - v_gas^2) / v_star^2
+    None when f_req <= 0 (the gas alone exceeds v_obs: no f can fix it) or
+    f_req >= 1 (v_bar already fits under the data).
+    """
+    if not mode or not getattr(likelihood, "fit_ml", False) \
+            or getattr(likelihood, "num_galaxy_params", 0) == 0:
+        return None
+    v = np.asarray(likelihood.yvar, dtype=float)
+    vb = np.asarray(likelihood.v_bar, dtype=float)
+    vs = np.asarray(likelihood.v_star, dtype=float)
+    if not np.any(vb > v):
+        return None
+    m = vs > 0
+    if not np.any(m):
+        return None
+    # v_gas^2 = v_bar^2 - v_star^2 (catalogue: v_bar^2 = v_star^2 + v_gas^2)
+    f_req = float(np.min((v[m] ** 2 - (vb[m] ** 2 - vs[m] ** 2)) / vs[m] ** 2))
+    if not (0.0 < f_req < 1.0):
+        return None
+    return f_req
+
+
+def optimise_fun_direct_nm(fcn_i, likelihood, *args, stage1_inc_mode=None, **kwargs):
+    """_optimise_fun_direct_nm_once at the catalogue Inc, plus -- only for
+    galaxies with v_bar > v_obs somewhere (stage1_inc_seeds) -- one more run
+    per extra stage-1 inclination, and with fit_ml one more at the catalogue
+    Inc with f lowered to bring v_bar under the data (stage1_f_seed). Keeps
+    the run with the lowest final (stage-2, joint) loss; same arguments and
+    return tuple as before."""
+    best = _optimise_fun_direct_nm_once(fcn_i, likelihood, *args, **kwargs)
+    mode = STAGE1_INC_MODE if stage1_inc_mode is None else stage1_inc_mode
+    for inc_s in stage1_inc_seeds(likelihood, mode):
+        print(f"    extra stage 1 at Inc={inc_s:.2f} (catalog {float(likelihood.inc_true):.2f}): "
+              "v_bar > v_obs at the catalogue Inc", flush=True)
+        res = _optimise_fun_direct_nm_once(fcn_i, likelihood, *args, stage1_inc=inc_s, **kwargs)
+        if np.isfinite(res[0]) and (not np.isfinite(best[0]) or res[0] < best[0]):
+            best = res
+    f_s = stage1_f_seed(likelihood, mode)
+    if f_s is not None:
+        print(f"    extra stage 1 at f={f_s:.3f}, catalogue Inc: v_bar > v_obs at f = 1", flush=True)
+        res = _optimise_fun_direct_nm_once(fcn_i, likelihood, *args, stage1_f=f_s, **kwargs)
+        if np.isfinite(res[0]) and (not np.isfinite(best[0]) or res[0] < best[0]):
+            best = res
+    return best
 
 
 # -----------------------------------------------------------------------------
@@ -959,6 +1085,19 @@ def main(comp, likelihood, tmax=90, pmin=-6, pmax=10, print_frequency=50,
         )
     comm.Barrier()
 
+    # Skip functions already seen at a lower complexity: an exact text match
+    # against previous_eqns_{comp}.txt. Their lower-comp copy has a shorter
+    # tree and the same likelihood, so it always has the smaller DL; refitting
+    # them only costs time (17% of comp 9, 28% of comp 8). Recorded as
+    # chi2=inf, which test_all_Fisher.py, match.py and combine_DL.py skip.
+    # ESR_SKIP_PREVIOUS=0 turns it off.
+    previous_fns = set()
+    if comp > 1 and SKIP_PREVIOUS_EQNS:
+        with open(likelihood.fn_dir + "/compl_" + str(comp) + "/previous_eqns_" + str(comp) + ".txt") as f:
+            previous_fns = {line.replace("\n", "").replace("'", "").strip() for line in f}
+        previous_fns.discard("")
+    n_skipped_previous = 0
+
     chi2 = np.zeros(len(fcn_list_proc))
     Niter_opt = np.zeros(len(fcn_list_proc))
     Nconv_opt = np.zeros(len(fcn_list_proc))
@@ -966,6 +1105,7 @@ def main(comp, likelihood, tmax=90, pmin=-6, pmax=10, print_frequency=50,
     inc_arr = np.full(len(fcn_list_proc), np.nan)
     d_arr = np.full(len(fcn_list_proc), np.nan)
     stage2_chi2_arr = np.full(len(fcn_list_proc), np.nan)
+    f_arr = np.full(len(fcn_list_proc), np.nan)
 
     max_param_shape = int(max(4, np.floor((comp - 1) / 2)))
     n_extra = 2 if getattr(likelihood, "use_physical_scale", False) else 0
@@ -980,13 +1120,51 @@ def main(comp, likelihood, tmax=90, pmin=-6, pmax=10, print_frequency=50,
 
     print(len(fcn_list_proc), flush=True)
 
-    for i in range(len(fcn_list_proc)):
+    # Checkpoint / resume, so a job killed late in a long run (comp 9 takes
+    # days per galaxy) does not lose its work. Every CHECKPOINT_EVERY functions this rank's
+    # arrays are saved to temp_dir (atomic replace); a restarted job with the
+    # same function list and MPI size resumes after the last saved function.
+    # The checkpoint is deleted once the final per-rank file is written.
+    ckpt_path = os.path.join(likelihood.temp_dir, f"ckpt_comp{comp}_rank{rank}of{size}.npz")
+    import hashlib  # not hash(): str hashes are randomised per process
+    fcn_key = hashlib.md5("\n".join(s.strip() for s in fcn_list_proc).encode()).hexdigest() \
+        + f"_{len(fcn_list_proc)}"
+    start_i = 0
+    if os.path.exists(ckpt_path):
+        try:
+            ck = np.load(ckpt_path, allow_pickle=False)
+            if str(ck["fcn_key"]) == fcn_key and ck["params"].shape == params.shape:
+                start_i = int(ck["next_i"])
+                chi2[:], params[:], inc_arr[:], d_arr[:] = ck["chi2"], ck["params"], ck["inc"], ck["d"]
+                stage2_chi2_arr[:], f_arr[:] = ck["stage2"], ck["f"]
+                Nconv_opt[:], Niter_opt[:], times[:] = ck["nconv"], ck["niter"], ck["times"]
+                flagged_rows = [s for s in ck["flagged"].tolist() if s]
+                print(f"RESUMING from checkpoint {ckpt_path}: functions 0..{start_i - 1} already done",
+                      flush=True)
+            else:
+                print(f"Ignoring checkpoint {ckpt_path}: different function list or layout", flush=True)
+        except Exception as e:
+            print(f"Ignoring unreadable checkpoint {ckpt_path}: {type(e).__name__}: {e}", flush=True)
+
+    def _save_checkpoint(next_i):
+        tmp = ckpt_path + ".tmp.npz"
+        np.savez(tmp, fcn_key=np.array(fcn_key), next_i=np.array(next_i), chi2=chi2, params=params,
+                 inc=inc_arr, d=d_arr, stage2=stage2_chi2_arr, f=f_arr, nconv=Nconv_opt,
+                 niter=Niter_opt, times=times, flagged=np.array(flagged_rows + [""], dtype=str))
+        os.replace(tmp, ckpt_path)
+
+    for i in range(start_i, len(fcn_list_proc)):
         if rank == 0 and ((i == 0) or ((i + 1) % print_frequency == 0)):
             print(f"{i + 1} of {len(fcn_list_proc)}", flush=True)
 
         start = time.time()
 
-        if DEGENERATE_TOKEN_RE.search(fcn_list_proc[i]):
+        if fcn_list_proc[i].replace("\n", "").replace("'", "").strip() in previous_fns:
+            chi2[i] = np.inf
+            j, count_lowest = 0, 0
+            flag_reason = ""
+            n_skipped_previous += 1
+        elif DEGENERATE_TOKEN_RE.search(fcn_list_proc[i]):
             # Never even attempt to fit a literal oo/zoo/nan candidate --
             # see DEGENERATE_TOKEN_RE's own comment for why these aren't
             # meaningful functions regardless of complexity. Recorded the
@@ -1015,7 +1193,7 @@ def main(comp, likelihood, tmax=90, pmin=-6, pmax=10, print_frequency=50,
             try:
                 (
                     chi2[i], params[i, :], j, count_lowest, success,
-                    inc_arr[i], d_arr[i], stage2_chi2_arr[i], flag_reason,
+                    inc_arr[i], d_arr[i], stage2_chi2_arr[i], flag_reason, f_arr[i],
                 ) = optimise_fun_direct_nm(
                     fcn_list_proc[i],
                     likelihood,
@@ -1062,12 +1240,25 @@ def main(comp, likelihood, tmax=90, pmin=-6, pmax=10, print_frequency=50,
             flush=True,
         )
 
+        # Every function builds its own jax.jit programs, and JAX keeps every
+        # compiled program in a process-wide cache: over ~28k comp-9
+        # functions that grows until the job is OOM-killed. Nothing compiled
+        # for one function is reused by the next, so clearing it costs nothing.
+        if CLEAR_JAX_CACHES and hasattr(jax, "clear_caches"):
+            jax.clear_caches()
+        if (i + 1) % CHECKPOINT_EVERY == 0:
+            _save_checkpoint(i + 1)
+
+    print(f"rank {rank}: skipped {n_skipped_previous} of {len(fcn_list_proc)} functions already "
+          f"present at a lower complexity (chi2 = inf)", flush=True)
+
     # Column layout: [stage1_chi2, shape+rho0/rs params (max_param_total),
-    # Inc, D, stage2_chi2, Nconv, Niter, times].
+    # Inc, D, stage2_chi2, (f if fit_ml), Nconv, Niter, times].
     out_arr = np.vstack(
         [chi2]
         + [params[:, i] for i in range(max_param_total)]
         + [inc_arr, d_arr, stage2_chi2_arr]
+        + ([f_arr] if getattr(likelihood, "fit_ml", False) else [])
         + [Nconv_opt, Niter_opt, times]
     )
     out_arr = np.transpose(out_arr)
@@ -1077,6 +1268,8 @@ def main(comp, likelihood, tmax=90, pmin=-6, pmax=10, print_frequency=50,
         out_arr,
         fmt="%.7e",
     )
+    if os.path.exists(ckpt_path):
+        os.remove(ckpt_path)
 
     comm.Barrier()
 

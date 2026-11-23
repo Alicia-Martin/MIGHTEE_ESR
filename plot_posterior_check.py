@@ -112,12 +112,14 @@ def load_galaxy_row(galaxy, fcn_index=FCN_INDEX):
     params = row[3:3 + max_param_total]
     deltas = row[3 + max_param_total:3 + 2 * max_param_total]
     inc_fit, d_fit = row[3 + 2 * max_param_total], row[3 + 2 * max_param_total + 1]
+    # _fml runs write f right after Inc, D (one extra column before Nconv, Niter, times)
+    f_fit = row[3 + 2 * max_param_total + 2] if len(row) > 3 + 2 * max_param_total + 5 else None
     if not np.isfinite(negloglike):
         return None
     return {
         "negloglike": negloglike, "codelen": codelen,
         "params": params, "deltas": deltas,
-        "inc": inc_fit, "d": d_fit,
+        "inc": inc_fit, "d": d_fit, "f": f_fit,
     }
 
 

@@ -1,9 +1,8 @@
 """
-Standalone correctness check for the 2026-08-06 baryon-term fix to
+Standalone correctness check for the baryon term in
 MIGHTEELikelihood.get_pred: v_circ(r)^2 = inc_ratio2*baryon_term(r) +
-dm_term(r), compared against self.yvar (v_rot, the TOTAL observed velocity).
-Before this fix, get_pred returned a DM-only v_circ compared directly
-against v_rot -- see get_pred's docstring and the development notes (not included).
+dm_term(r), compared against self.yvar (v_rot, the TOTAL observed velocity),
+rather than a DM-only v_circ -- see get_pred's docstring.
 
 Three checks, in increasing order of how much of get_pred they exercise:
 

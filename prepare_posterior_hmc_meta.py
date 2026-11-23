@@ -35,6 +35,9 @@ def _parse_args():
                     "machine). Required on Glamdring: point it at wherever "
                     "run_esr_mightee.py actually wrote this run's output there, "
                     "e.g. fitting/output/output_mightee_rhoTrue.")
+    p.add_argument("--fit-ml", action="store_true", help="The run fitted the stellar M/L "
+                    "factor f (an _fml run): also sample f, with its TruncatedNormal(1, "
+                    "sigma_frac) prior. Stored in meta.json for the per-galaxy jobs and merge.")
     return p.parse_args()
 
 
@@ -61,6 +64,14 @@ def main():
             f"actually live on this machine."
         )
 
+    has_f = [r.get("f") is not None for r in rows.values()]
+    if args.fit_ml and not all(has_f):
+        raise SystemExit(f"--fit-ml, but {has_f.count(False)}/{len(rows)} rows have no f column "
+                         f"under {hmc.grid.RESULTS_DIR!r} -- is this an _fml run?")
+    if not args.fit_ml and any(has_f):
+        raise SystemExit(f"The rows under {hmc.grid.RESULTS_DIR!r} have an f column (an _fml "
+                         f"run): pass --fit-ml, or f would be held at 1 instead of sampled.")
+
     probe_galaxy = next(iter(rows))
     probe_likelihood = hmc.MIGHTEELikelihood(
         data_file=hmc.DATA_FILE, name=probe_galaxy, run_name="posterior_hmc_probe",
@@ -78,6 +89,7 @@ def main():
         "active_names": active_names,
         "fallback_log10": fallback_log10,
         "fcn_index": fcn_index,
+        "fit_ml": bool(args.fit_ml),
         "n_galaxies_with_rows": len(rows),
         "n_galaxies_total": len(galaxies),
     }

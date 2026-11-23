@@ -44,7 +44,7 @@
 #SBATCH --ntasks 1
 #SBATCH --job-name=mightee
 #SBATCH -p cclake
-#SBATCH -A YOUR-ACCOUNT        # set to your allocation
+#SBATCH -A dirac-dp016-CPU
 #SBATCH --exclusive
 #SBATCH -t 08:00:00
 #SBATCH --array=0-128
@@ -53,16 +53,14 @@
 
 . /etc/profile.d/modules.sh                # Leave this line (enables the module command)
 module purge                               # Removes all modules still loaded
-# 2026-08-26: plain `module purge` was NOT clearing a pre-loaded
-# intel-oneapi-compilers/2023.2.4/..., which then conflicted with the
-# 2022.1.0 build rhel8/default-icl needs (job 34375468's .err, task 47) --
-# looks like a sticky module on this system. Unload it explicitly first,
-# per that error's own HINT. Safe no-op if it isn't loaded.
+# `module purge` does not clear a sticky intel-oneapi-compilers/2023.2.4
+# module on this system, which conflicts with the 2022.1.0 build that
+# rhel8/default-icl needs. Unload it explicitly; no-op if it isn't loaded.
 module unload intel-oneapi-compilers/2023.2.4/gcc/4lbvg4hv 2>/dev/null || true
 module load rhel8/default-icl              # REQUIRED - loads the basic environment
 
 echo "DEBUG: cwd=$(pwd)  SLURM_SUBMIT_DIR=${SLURM_SUBMIT_DIR:-unset}"
-source "${VENV:-../esr_WL_env}/bin/activate"
+source ../esr_WL_env/bin/activate
 
 mkdir -p logs
 
@@ -90,5 +88,10 @@ echo "Array task $SLURM_ARRAY_TASK_ID: galaxy=$GALAXY comp=$COMP use_physical_sc
 PY_ARGS=(--galaxy "$GALAXY" --comp "$COMP" --run-name "mightee" "$PHYS_FLAG")
 if [ "$RERUN" = "1" ] || [ "$RERUN" = "true" ]; then
     PY_ARGS+=(--rerun)
+fi
+# START_FROM=match (or fisher/combine) resumes a galaxy whose job crashed in a
+# later stage, reusing the earlier stages' output files.
+if [ -n "${START_FROM:-}" ]; then
+    PY_ARGS+=(--start-from "$START_FROM")
 fi
 mpirun -np 1 python3 run_esr_mightee.py "${PY_ARGS[@]}"

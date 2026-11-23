@@ -41,6 +41,12 @@ def _parse_args():
                     "galaxy's own index in galaxy_names.txt, so every galaxy gets a "
                     "distinct seed -- matches main()'s own seed=gi convention in the "
                     "serial script.")
+    p.add_argument("--prior-mode", choices=["fixed", "centred"], default=None,
+                    help="Prior on log10|param|: fixed box (default, plot_posterior_hmc."
+                         "PRIOR_BOX) or centred on the ML value (the old behaviour).")
+    p.add_argument("--fixed-inc-d", action="store_true",
+                    help="Hold Inc/D at the ESR best fit instead of sampling them "
+                         "with the catalogue prior (the old behaviour).")
     return p.parse_args()
 
 
@@ -59,6 +65,9 @@ def main():
     active_names = meta["active_names"]
     fallback_log10 = meta["fallback_log10"]
     fcn_index = meta["fcn_index"]
+    fit_ml = bool(meta.get("fit_ml", False))
+    if fit_ml and args.fixed_inc_d:
+        raise SystemExit("--fixed-inc-d is not supported for an _fml run (f would be fixed too).")
 
     hmc.grid.COMP = comp
     if args.results_dir is not None:
@@ -97,7 +106,7 @@ def main():
         likelihood = hmc.MIGHTEELikelihood(
             data_file=hmc.DATA_FILE, name=args.galaxy,
             run_name=f"posterior_hmc/{args.galaxy}/comp{comp}",
-            data_dir=scratch_dir, use_physical_scale=True,
+            data_dir=scratch_dir, use_physical_scale=True, fit_ml=fit_ml,
         )
     except Exception as e:
         with open(result_path, "w") as f:
@@ -110,7 +119,12 @@ def main():
     fcn_i, eq, integrated = likelihood.run_sympify(fcn_string, tmax=60, try_integration=False)
     eq_numpy = match_mod.make_lambdified_eq(eq, nshape)
     theta_ml = hmc.extract_theta_ml(row, nshape)
-    fop = hmc.grid.build_fop(likelihood, eq_numpy, integrated, row["inc"], row["d"])
+    if args.fixed_inc_d:
+        fop = hmc.grid.build_fop(likelihood, eq_numpy, integrated, row["inc"], row["d"])
+        prior = None
+    else:
+        fop = hmc.build_fop_free(likelihood, eq_numpy, integrated)
+        prior = hmc.galaxy_prior(likelihood)
 
     log_centers, signs, used_fallback = [], [], []
     for name, val in zip(active_names, theta_ml):
@@ -122,9 +136,11 @@ def main():
             signs.append(1.0)
             used_fallback.append(name)
 
+    boxes = hmc.param_boxes(active_names, log_centers, args.prior_mode)
     try:
         samples, site_names, stats, n_divergent = hmc.run_hmc_for_galaxy(
-            fop, signs, log_centers, seed=args.seed)
+            fop, signs, log_centers, seed=args.seed, prior=prior,
+            galaxy_init=(row["inc"], row["d"], row.get("f")), boxes=boxes)
     except Exception as e:
         with open(result_path, "w") as f:
             json.dump({"galaxy": args.galaxy, "status": "skipped_nuts_failed",
@@ -134,25 +150,38 @@ def main():
 
     arr = hmc.samples_to_array(samples, site_names)
     np.savez_compressed(samples_path, arr=arr)
+    gal_ml = [] if prior is None else [float(row["inc"]), float(row["d"])] + (
+        [float(row["f"])] if fit_ml else [])
+    gal_names = [] if prior is None else (hmc.GALAXY_PARAM_NAMES_ML if fit_ml else hmc.GALAXY_PARAM_NAMES)
+    theta_full = np.concatenate([theta_ml, gal_ml])
+    mlc = hmc.ml_check(samples, theta_full, fop)
 
     stats_plain = {site: {k: float(v) for k, v in s.items()} for site, s in stats.items()}
     result = {
         "galaxy": args.galaxy,
         "status": "ok",
         "n_data": n_data,
-        "theta_ml": [float(v) for v in theta_ml],
-        "active_names": active_names,
+        # With Inc/D sampled, they are the last two columns of the samples
+        # and of theta_ml (Inc in deg, D in kpc; the D sample column is Mpc).
+        # With fit_ml, f_ml follows D (linear units in samples and theta_ml).
+        "theta_ml": [float(v) for v in theta_ml] + gal_ml,
+        "active_names": active_names + gal_names,
+        "prior": prior,
+        "boxes": [list(map(float, b)) for b in boxes],
+        "ml_check": mlc,
         "site_names": site_names,
         "used_fallback": used_fallback,
         "n_divergent": n_divergent,
         "stats": stats_plain,
         "inc": float(row["inc"]),
         "d": float(row["d"]),
+        "f": float(row["f"]) if fit_ml else None,
     }
     with open(result_path, "w") as f:
         json.dump(result, f)
     max_rhat = max(s["r_hat"] for s in stats_plain.values())
-    print(f"[{args.galaxy}] done: N={n_data} divergences={n_divergent} max_r_hat={max_rhat:.3f}")
+    print(f"[{args.galaxy}] done: N={n_data} divergences={n_divergent} max_r_hat={max_rhat:.3f} "
+          f"min_nll-ML={mlc['delta']:+.3f} {mlc['flag']}")
 
 
 if __name__ == "__main__":

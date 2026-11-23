@@ -56,6 +56,9 @@ def _angular_diameter_distance_kpc(z):
     return float(_COSMOLOGY.angular_diameter_distance(z).to(apu.kpc).value)
 
 
+ML_FILE = "RAR_MIGHTEE_total_ml_ratios_direct.txt"
+
+
 class MIGHTEELikelihood(Likelihood):
     """
     Likelihood for MIGHTEE rotation-curve data.
@@ -82,6 +85,7 @@ class MIGHTEELikelihood(Likelihood):
         fn_set='core_maths',
         use_physical_scale=False,
         fn_library_dir=None,
+        fit_ml=False,
     ):
         # G in units of kpc (km/s)^2 / Msun
         self.G = astropy.constants.G.to(
@@ -115,28 +119,36 @@ class MIGHTEELikelihood(Likelihood):
         self.e_d = self.galaxy_data["e_d"]
         self.num_galaxy_params = 2
 
-        super().__init__(data_file, run_name, data_dir=data_dir, fn_set=fn_set)
+        # Optional stellar mass-to-light factor f, a third galaxy parameter after
+        # Inc and D: v_bar^2 -> v_bar^2 + (f - 1) v_star^2 (stars only), with
+        # f ~ TruncatedNormal(1, sigma_frac, 0, inf). See _load_sigma_frac_ml.
+        self.fit_ml = fit_ml
+        if fit_ml:
+            self.v_star = jnp.array(self.galaxy_data["Vstar"], dtype=jnp.float64)
+            self.sigma_frac_ml = self._load_sigma_frac_ml(data_file, name)
+            self.num_galaxy_params = 3
 
-        # Overrides the base class's own esr_dir-derived fn_dir: the function
-        # library lives in the separate, shared dm-esr/WL/ESR checkout, not
-        # inside this project's own esr/ copy. This path is machine-specific,
-        # so it is resolved in priority order: explicit fn_library_dir arg
-        # (what run_esr_mightee.py's --fn-library-dir bakes into the addqueue
-        # command line, since addqueue jobs can't be relied on to inherit the
-        # submitting shell's env) > ESR_FUNCTION_LIBRARY_DIR env var (for
-        # interactive/notebook use) > a default local path, so interactive
-        # use needs neither set if the library is in <repo>/function_library/core_maths.
+        super().__init__(data_file, run_name, data_dir=data_dir, fn_set=fn_set)
         self.fn_dir = fn_library_dir or os.environ.get(
             "ESR_FUNCTION_LIBRARY_DIR",
             os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "function_library", "core_maths"),
         )
         self.ylabel = r'$V_{\rm obs}$'
 
+    @staticmethod
+    def _load_sigma_frac_ml(data_file, name):
+        """Width of the f prior for this galaxy, from the SED posterior of the
+        integrated K-band M/L: sigma_frac = 0.5 (ML_Ks_84 - ML_Ks_16) / ML_Ks_50.
+        ML_FILE is looked for next to the catalogue, and a galaxy missing from it
+        is an error rather than a silent default."""
+        path = os.path.join(os.path.dirname(os.path.abspath(data_file)), ML_FILE)
+        ml = pd.read_csv(path)
+        row = ml[ml["galaxy"] == name]
+        if row.empty:
+            raise ValueError(f"No M/L row for galaxy '{name}' in {path}")
+        return float(0.5 * (row["ML_Ks_84"].iloc[0] - row["ML_Ks_16"].iloc[0]) / row["ML_Ks_50"].iloc[0])
+
     def _load_galaxy_data(self, data_file, name):
-        # sep=None + engine="python" auto-sniffs the delimiter, so this reads
-        # both the comma-separated rar_with_ml_direct_phot.csv (81 galaxies)
-        # and the whitespace-separated ALL_gbar_gobs_RAR_direct_phot.txt (129
-        # galaxies, the fuller catalog) without needing a format-specific path.
         df = pd.read_csv(data_file, sep=None, engine="python")
         galaxy = df[df["Galaxy"] == name].copy()
 
@@ -151,27 +163,16 @@ class MIGHTEELikelihood(Likelihood):
 
         distance_true = _angular_diameter_distance_kpc(z)
         e_d = (PECULIAR_VELOCITY_KMS / (_C_KMS * z)) * distance_true
-
-        # Recompute R (kpc) from Radius_arcsec using the SAME cosmology-derived
-        # distance_true, so R and distance_true are self-consistent: at D ==
-        # distance_true, R * D/distance_true == R exactly. Do NOT use the CSV's
-        # own Radius_kpc column (computed with a different/unknown cosmology).
         R_kpc = galaxy["Radius_arcsec"].to_numpy() * ARCSEC_TO_RAD * distance_true
 
         return {
             "R": R_kpc,
-            # v_circ (not v_rot) is the fit target -- it's the catalog's own
-            # exact quadrature reconstruction (v_circ = sqrt(v_bar_total^2 +
-            # v_DM^2)), the theoretically clean circular velocity this
-            # model's own vcirc prediction should be compared against. v_rot
-            # is close (median residual ~0.2 km/s) but not identical, so
-            # v_circ is used specifically. Error bars still come from
-            # v_rot's columns, since v_circ has no error columns of its own.
             "Vobs": galaxy["v_circ"].to_numpy(),
             "e_Vobs_lo": galaxy["v_rot_err_lo"].to_numpy(),
             "e_Vobs_hi": galaxy["v_rot_err_hi"].to_numpy(),
             "Vbar": galaxy["v_bar_total"].to_numpy(),
             "e_Vbar": galaxy["v_bar_total_err"].to_numpy(),
+            "Vstar": galaxy["v_stars"].to_numpy() if "v_stars" in galaxy.columns else None,
             "z": z,
             "inc_true": inc_true,
             "e_inc": e_inc,
@@ -410,20 +411,9 @@ class MIGHTEELikelihood(Likelihood):
         middle_points = (x_0[1:] + x_0[:-1]) / 2
         widths = np.diff(x_0)
 
-        # Cubic spline through the OBSERVED (x, mass) pairs only -- r_start
-        # is deliberately NOT a spline knot. The first segment's midpoint
-        # (between r_start and x_sorted[0]) is therefore outside the
-        # spline's fitted domain and evaluated via scipy's default
-        # extrapolation.
         spline = InterpolatedUnivariateSpline(x_sorted, mass, k=3)
         der_fit = spline(middle_points, nu=3)
 
-        # Tightest (smallest) finite, positive per-point velocity
-        # uncertainty across the galaxy, as the reference precision.
-        # Guarded explicitly: a single reported yerr of exactly 0 would
-        # otherwise drive error_vel, and therefore EVERY segment's
-        # step_size, to exactly 0 -- i.e. would poison the whole galaxy's
-        # adaptive grid, not just one segment.
         abs_yerr = np.abs(yerr_sorted)
         finite_positive = np.isfinite(abs_yerr) & (abs_yerr > 0)
         if not np.any(finite_positive):
@@ -436,9 +426,6 @@ class MIGHTEELikelihood(Likelihood):
         error_vel = min_abs_yerr / len(x_sorted) * vel_error
         error = 2 * error_vel * y_sorted * x_sorted / self.G
 
-        # error/middle_points/der_fit/widths all have length
-        # len(x_sorted) (x_0 has len(x_sorted)+1 entries -> len(x_sorted)
-        # segments) -- elementwise division below is shape-safe.
         denom = middle_points * der_fit
         with np.errstate(divide="ignore", invalid="ignore"):
             step_size = np.sqrt(np.abs(6 * error / denom))
@@ -448,11 +435,6 @@ class MIGHTEELikelihood(Likelihood):
         with np.errstate(divide="ignore", invalid="ignore"):
             num_points_raw = widths / safe_step
 
-        # Per-segment fallback: non-finite/non-positive step_size (der_fit
-        # exactly 0 -> division by zero; der_fit and error both 0 -> 0/0
-        # nan; a spline ill-conditioned by fitting a cubic through as few
-        # as 4 points) falls back to n_insert for THAT segment, not the
-        # whole galaxy.
         num_points_raw = np.where(
             step_size_ok & np.isfinite(num_points_raw), num_points_raw, n_insert
         )
@@ -460,10 +442,6 @@ class MIGHTEELikelihood(Likelihood):
         num_points = np.clip(np.round(num_points_raw), num_points_min, num_points_max)
 
         if not np.all(np.isfinite(num_points)):
-            # Should be unreachable given the substitution above; a hard,
-            # loud failure here (caught by add_points's try/except, which
-            # falls back to the fixed grid for the whole galaxy) is
-            # preferable to silently casting a NaN/inf to int.
             raise RuntimeError("num_points contains non-finite values after clamping")
 
         num_points = num_points.astype(int)
@@ -492,19 +470,6 @@ class MIGHTEELikelihood(Likelihood):
                 all_a = list(sympy.symbols(' '.join([f'a{i}' for i in range(nparam)]), real=True))
                 return sympy.lambdify([x] + all_a, expr, modules=["jax"])
         except KeyError:
-            # Some function-library entries are literal degenerate constants
-            # (e.g. "zoo"/ComplexInfinity, which can appear when ESR's own
-            # generation/simplification collapses some tree to a symbolic
-            # infinity). sympy's pycode/jax printer has no registered
-            # handler for these special constants (Abs/ComplexInfinity/nan)
-            # and raises a bare KeyError inside sympy.lambdify itself --
-            # not a normal "bad function" failure mode, and since
-            # run_sympify calls this unconditionally, an unhandled KeyError
-            # would crash the whole batch run instead of just this one
-            # candidate. The correct semantic treatment is that this
-            # candidate is undefined/divergent everywhere, so it should
-            # always report infinite loss (ranked last, same as any other
-            # always-fails function), not crash.
             def _always_inf(xv, *_a):
                 return jnp.full(jnp.shape(jnp.asarray(xv)), jnp.inf)
             return _always_inf
@@ -541,24 +506,9 @@ class MIGHTEELikelihood(Likelihood):
                 }
             )
         except Exception:
-            # Same failure class as the "zoo"/ComplexInfinity KeyError
-            # _make_lambdify already guards against (see its docstring),
-            # but one level earlier: a small number of function-library
-            # strings fail to sympify at all. Falling back to sympy.zoo is
-            # guaranteed to hit _make_lambdify's existing KeyError ->
-            # _always_inf path below, giving this candidate the same
-            # "always fails, ranked last" treatment as any other
-            # degenerate entry instead of crashing run_sympify's caller.
             eq = sympy.zoo
 
         max_param = 4
-        # max_param is hardcoded here, but test_all.py/test_all_Fisher.py/
-        # match.py all size their output columns using the comp-dependent
-        # max_param_shape = max(4, floor((comp-1)/2)), which only exceeds 4
-        # starting at comp=11. count_params only ever scans for "a0".."a3"
-        # when max_param=4, so a genuine 5th shape parameter (a4) would be
-        # silently undercounted rather than raising -- refuse loudly instead.
-        # This pipeline is not yet safe past comp=10.
         if "a4" in fcn_i or "a5" in fcn_i:
             raise ValueError(
                 f"run_sympify: {fcn_i!r} appears to need a 5th+ shape "
@@ -632,13 +582,13 @@ class MIGHTEELikelihood(Likelihood):
         """
         return self._make_lambdify(eq, nparam_shape)
 
-    def get_pred(self, x, a, eq_numpy, integrated, D=None, Inc=None, return_components=False):
+    def get_pred(self, x, a, eq_numpy, integrated, D=None, Inc=None, return_components=False, f_ml=None):
         """
         Convert the ESR density model into the TOTAL predicted circular
         velocity v_circ(r), for direct comparison against self.yvar (v_circ,
         the catalog's TOTAL observed rotation velocity -- baryons + DM):
 
-            v_circ(r)^2 = inc_ratio2 * baryon_term(r) + dm_term(r)
+            v_circ(r)^2 = inc_ratio2 * (baryon_term(r) + dm_term(r))
 
         where:
           - dm_term(r) = G * M_DM(<r) / r, with M_DM(<r) the enclosed mass of
@@ -651,11 +601,15 @@ class MIGHTEELikelihood(Likelihood):
             per-component fit scaling here -- only a (D/distance_true)
             geometric rescale of the fixed baryon term.
           - inc_ratio2 = (sin(deg2rad(Inc_eff))/sin(deg2rad(self.inc_true)))**2
-            applies ONLY to baryon_term, not to dm_term: the inclination
-            correction rescales the baryonic v^2, not the dark-matter term,
-            since inclination affects how the observed line-of-sight
-            velocity relates to the baryonic disk geometry, not the
-            spherically-symmetric DM enclosed-mass term.
+            multiplies the WHOLE model, baryons and DM: the inclination enters
+            through the data, not through either mass component. yvar is
+            v_los/sin(inc_true), so at inclination Inc the true rotation is
+            yvar*sin(inc_true)/sin(Inc); comparing yvar with the model
+            projected by sin(Inc)/sin(inc_true) is the same chi^2 (yerr is
+            deprojected with the same factor). v_bar comes from photometry,
+            which does not depend on the inclination. Applying the factor to
+            the baryon term alone would be equivalent only when the DM term
+            has a free amplitude (use_physical_scale=True).
 
         Modes (apply to the DM term only):
           - use_physical_scale=False:
@@ -679,14 +633,14 @@ class MIGHTEELikelihood(Likelihood):
                 None does NOT skip the baryon term -- it is always added,
                 only its D-dependent rescale collapses to 1.
             Inc: inclination nuisance parameter (degrees), optional. When
-                given, inc_ratio2 (see above) rescales baryon_term only.
+                given, inc_ratio2 (see above) rescales baryon_term + dm_term.
                 Leave as None (default) to use Inc_eff = self.inc_true, i.e.
                 inc_ratio2 == 1 -- again NOT "skip the correction": the
                 baryon term is still added, just at its catalog-fiducial
                 inclination (the same convention D=None uses).
             return_components: when True, additionally return
                 (dm_v2, baryon_v2) -- the two terms' own contribution to
-                v_circ^2 (dm_v2 = dm_term, baryon_v2 = inc_ratio2*baryon_term,
+                v_circ^2 (dm_v2 = inc_ratio2*dm_term, baryon_v2 = inc_ratio2*baryon_term,
                 i.e. v_circ^2 = dm_v2 + baryon_v2 exactly) -- as
                 (v_circ, dm_v2, baryon_v2) instead of just v_circ. f_loss
                 requests return_components=True and discards dm_v2/
@@ -779,20 +733,8 @@ class MIGHTEELikelihood(Likelihood):
                 # Interpolate back to the observed radii
                 mass = jnp.interp(r_obs, r_dense, mass_dense)
 
-        # Step 2: combine the ESR-searched DM term with the FIXED (non-fit)
-        # baryon term, in quadrature. MIGHTEE has no upsilon (mass-to-light)
-        # free parameters, so baryon_term is a single fixed
-        # per-radius-point value (self.v_bar, index-aligned with x via
-        # self.xvar) rather than a fit-scaled sum of disk/gas/bulge terms.
         dm_term = jnp.where(r_obs_safe > 0, self.G * mass / r_obs_safe, 0.0)
 
-        # D/Inc default to the catalog's fiducial values (NOT "skip the
-        # correction") when None -- the baryon term must ALWAYS be added,
-        # since the fit target (self.yvar/v_circ) is the TOTAL observed
-        # velocity in every call path, including the shape-only stage-1
-        # DIRECT search. At these defaults inc_ratio2==1 and
-        # (D_eff/distance_true)==1, i.e. baryon_term == self.v_bar**2
-        # unscaled -- the catalog's own baryon curve, verbatim.
         D_eff = self.distance_true if D is None else D
         Inc_eff = self.inc_true if Inc is None else Inc
 
@@ -800,20 +742,32 @@ class MIGHTEELikelihood(Likelihood):
         sin_inc_true_safe = jnp.where(jnp.abs(sin_inc_true) > 1e-8, sin_inc_true, 1e-8)
         inc_ratio2 = (jnp.sin(jnp.deg2rad(Inc_eff)) / sin_inc_true_safe) ** 2
 
-        baryon_term = (D_eff / self.distance_true) * (self.v_bar ** 2)
-        baryon_v2 = inc_ratio2 * baryon_term
+        # v_bar^2 = v_star^2 + v_gas^2 in the catalogue, so this is f v_star^2 + v_gas^2
+        v_bar2 = self.v_bar ** 2 if f_ml is None else self.v_bar ** 2 + (f_ml - 1.0) * self.v_star ** 2
+        baryon_term = (D_eff / self.distance_true) * v_bar2
 
-        v2 = baryon_v2 + dm_term
+        baryon_v2 = inc_ratio2 * baryon_term
+        dm_v2 = inc_ratio2 * dm_term
+
+        v2 = baryon_v2 + dm_v2
         v_circ = jnp.sqrt(jnp.maximum(v2, 0.0))
         if return_components:
-            return v_circ, dm_term, baryon_v2
+            return v_circ, dm_v2, baryon_v2
         return v_circ
 
     @staticmethod
     def neg_log_asymmetric_gaussian(y_true, y_pred, err_lo, err_hi):
         """
-        Piecewise Gaussian with different lower/upper errors.
-        Uses err_hi if model lies above the data, err_lo otherwise.
+        Split-normal (two-piece Gaussian) negative log-likelihood per point,
+        up to a model-independent constant: width err_hi if the model lies
+        above the data, err_lo otherwise. The normalization is dropped.
+
+        No log(sigma) term: with a split normal it is log((err_lo+err_hi)/2),
+        the same for every model, so it cannot change fits or DL differences.
+        Using log(sigma_side) instead would not be constant: -logL would jump
+        by log(err_lo/err_hi) whenever the model crosses a data point, so
+        equivalent forms such as 1/(x**2+x) and 1/(x*(x+1)) could get
+        different -logL from optimizer noise alone.
         """
         err_lo = jnp.asarray(err_lo, dtype=jnp.float64)
         err_hi = jnp.asarray(err_hi, dtype=jnp.float64)
@@ -821,7 +775,7 @@ class MIGHTEELikelihood(Likelihood):
         sigma = jnp.where(y_pred >= y_true, err_hi, err_lo)
         sigma = jnp.where(sigma > 0, sigma, 1e-12)
 
-        return 0.5 * ((y_true - y_pred) / sigma) ** 2 + jnp.log(sigma)
+        return 0.5 * ((y_true - y_pred) / sigma) ** 2
 
     def _neg_log_truncated_gaussian(self, val, mean, sd, lower, upper):
         """
@@ -857,12 +811,13 @@ class MIGHTEELikelihood(Likelihood):
                 True, `a` is [model params..., Inc, D] (length self.nparam +
                 self.num_galaxy_params); D rescales the DM-term radius and
                 the baryon term's (D/distance_true) factor via
-                get_pred(..., D=D); Inc rescales ONLY the baryon term via
-                get_pred(..., Inc=Inc) (inc_ratio2 = (sin(Inc)/sin(inc_true))**2,
-                since inclination affects only the baryonic v^2 term, not the
-                DM term); and both Inc and D additionally get a
+                get_pred(..., D=D); Inc enters as the projection of the
+                whole model, v_pred = v_circ*sin(Inc), compared with the
+                catalogue data re-projected with sin(inc_true) (see f_loss);
+                and both Inc and D additionally get a
                 truncated-Gaussian prior anchored to their catalog values.
-            fixed_galaxy_params: (Inc, D) tuple, optional. Lets a caller
+            fixed_galaxy_params: (Inc, D) tuple, or (Inc, D, f) with fit_ml
+                (f = 1 if left out), optional. Lets a caller
                 evaluate the pure data likelihood at a specific Inc/D (e.g.
                 the true jointly-optimized value) while keeping `a` as the
                 model-parameter-only vector, instead of being limited to
@@ -935,19 +890,23 @@ class MIGHTEELikelihood(Likelihood):
                     # Inc/D held fixed but still priced by the prior --
                     # see fixed_galaxy_params in this method's docstring.
                     model_params = a
-                    Inc, D = fixed_galaxy_params
+                    Inc, D, *f_fixed = fixed_galaxy_params
+                    f_ml = f_fixed[0] if f_fixed else None
                 else:
                     n_model = self.nparam
                     model_params = a[:n_model]
                     Inc = a[n_model]
                     D = a[n_model + 1]
+                    f_ml = a[n_model + 2] if self.fit_ml else None
             else:
                 model_params = a
                 if fixed_galaxy_params is not None:
-                    Inc, D = fixed_galaxy_params
+                    Inc, D, *f_fixed = fixed_galaxy_params
+                    f_ml = f_fixed[0] if f_fixed else None
                 else:
                     D = None
                     Inc = None
+                    f_ml = None
 
             # Use denser grid for the density positivity check when available,
             # rescaled by D the same way get_pred rescales it internally.
@@ -958,17 +917,24 @@ class MIGHTEELikelihood(Likelihood):
                 r_check = r_check * (D / self.distance_true)
             density_penalty = check_density(model_params, self.eq_diff, r_check)
 
-            # return_components=True is used here (rather than the plain
-            # vpred-only call) even though dm_v2/baryon_v2 go unused, purely
-            # so that get_pred's vpred computation is guaranteed identical
-            # regardless of which call mode is used elsewhere.
-            vpred, _, _ = self.get_pred(
-                xvar, model_params, eq_numpy, integrated=integrated, D=D, Inc=Inc,
-                return_components=True,
+            # Forward model in projected (line-of-sight) velocity:
+            #   data:  v_raw = yvar * sin(inc_true), err_raw = yerr * sin(inc_true)
+            #          (undo the catalogue deprojection; fixed numbers, no parameter dependence)
+            #   model: v_circ = sqrt((D/D_true) v_bar^2 + v_DM^2(r D/D_true))   [get_pred, Inc=None]
+            #          (with fit_ml, v_bar^2 = f v_star^2 + v_gas^2)
+            #          v_pred = v_circ * sin(Inc)
+            # Same chi^2 as comparing yvar with v_circ * sin(Inc)/sin(inc_true).
+            v_circ, _, _ = self.get_pred(
+                xvar, model_params, eq_numpy, integrated=integrated, D=D, Inc=None,
+                return_components=True, f_ml=f_ml,
             )
+            sin_cat = jnp.sin(jnp.deg2rad(self.inc_true))
+            Inc_eff = self.inc_true if Inc is None else Inc
+            v_raw = yvar * sin_cat
+            v_pred = v_circ * jnp.sin(jnp.deg2rad(Inc_eff))
 
             nll = jnp.sum(
-                self.neg_log_asymmetric_gaussian(yvar, vpred, yerr_lo, yerr_hi)
+                self.neg_log_asymmetric_gaussian(v_raw, v_pred, yerr_lo * sin_cat, yerr_hi * sin_cat)
             )
 
             if include_priors:
@@ -976,6 +942,10 @@ class MIGHTEELikelihood(Likelihood):
                     self._neg_log_truncated_gaussian(Inc, self.inc_true, self.e_inc, 0.0, 90.0) +
                     self._neg_log_truncated_gaussian(D, self.distance_true, self.e_d, 0.0, np.inf)
                 )
+                if self.fit_ml:
+                    priors = priors + self._neg_log_truncated_gaussian(
+                        1.0 if f_ml is None else f_ml, 1.0, self.sigma_frac_ml, 0.0, np.inf
+                    )
                 nll = nll + priors
 
             return density_penalty + nll

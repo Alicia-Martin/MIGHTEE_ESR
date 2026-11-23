@@ -5,10 +5,12 @@ import os
 import numpy as np
 from prettytable import PrettyTable
 
+from combine_all_galaxies import DEFAULT_MIN_POINTS, global_dir_name
 
-def load_global_final(data_dir, base_run_name, rho_tag, comp):
+
+def load_global_final(data_dir, base_run_name, rho_tag, comp, min_points=None):
     out_dir = os.path.join(data_dir, "fitting", "output", f"output_{base_run_name}_{rho_tag}",
-                            "GLOBAL", f"comp{comp}")
+                            global_dir_name(min_points), f"comp{comp}")
     dat_path = os.path.join(out_dir, f"global_final_{comp}.dat")
     if not os.path.exists(dat_path):
         return None
@@ -47,30 +49,31 @@ def _parse_args():
     p.add_argument("--top-n", type=int, default=200, help="How many functions to keep "
                     "in the final combined ranking (still writes every finite-DL row "
                     "to the .dat file; only the printed/pretty table is truncated).")
+    p.add_argument("--min-points", default=",".join(map(str, DEFAULT_MIN_POINTS)),
+                    help="Comma-separated thresholds: besides GLOBAL/, also rank each "
+                    "GLOBAL_minpts{N}/ written by combine_all_galaxies.py (default '4,5'). "
+                    "Only the full-sample table is printed; pass '' to skip.")
     return p.parse_args()
 
 
-if __name__ == "__main__":
-    args = _parse_args()
-    rho_tag = "rhoTrue" if args.use_physical_scale else "rhoFalse"
-    comps = [int(c) for c in args.comps.split(",")]
-
+def rank_across_comps(args, rho_tag, comps, min_points=None, verbose=True):
     all_rows = []
     missing_comps = []
     for comp in comps:
-        rows = load_global_final(args.data_dir, args.run_name, rho_tag, comp)
+        rows = load_global_final(args.data_dir, args.run_name, rho_tag, comp, min_points)
         if rows is None:
             missing_comps.append(comp)
             continue
         all_rows.extend(rows)
 
+    label = "full sample" if min_points is None else f">= {min_points} points"
     if missing_comps:
-        print(f"Warning: no global_final_{{comp}}.dat found for comp(s) {missing_comps} "
+        print(f"Warning ({label}): no global_final_{{comp}}.dat found for comp(s) {missing_comps} "
               f"-- run combine_all_galaxies.py for those first. Continuing with the rest.")
 
     if not all_rows:
-        print("No global results found for any requested comp -- nothing to combine.")
-        raise SystemExit(1)
+        print(f"No global results found for any requested comp ({label}) -- nothing to combine.")
+        return
 
     # Deduplicate by negloglike (same convention as CLASH's combine_comp.py):
     # a function re-appearing at a higher complexity with an identical
@@ -85,7 +88,8 @@ if __name__ == "__main__":
 
     deduped_rows = sorted(best_by_negloglike.values(), key=lambda r: r["DL"])
 
-    out_dir = os.path.join(args.data_dir, "fitting", "output", f"output_{args.run_name}_{rho_tag}", "GLOBAL")
+    out_dir = os.path.join(args.data_dir, "fitting", "output", f"output_{args.run_name}_{rho_tag}",
+                           global_dir_name(min_points))
     os.makedirs(out_dir, exist_ok=True)
 
     ptab = PrettyTable()
@@ -101,9 +105,24 @@ if __name__ == "__main__":
                 ptab.add_row([rank, row["function"], row["comp"], f"{row['DL']:.2f}",
                               f"{row['negloglike']:.2f}", f"{row['codelen']:.2f}", f"{row['aifeyn']:.2e}"])
 
-    print(ptab)
+    if verbose:
+        print(ptab)
     with open(os.path.join(out_dir, "global_results_pretty_all_comps.txt"), "w") as f:
         print(ptab, file=f)
-    print(f"\nSaved: {dat_path}")
+    print(f"\nSaved ({label}): {dat_path}")
     print(f"Combined {len(comps) - len(missing_comps)}/{len(comps)} complexities, "
           f"{len(all_rows)} candidate rows -> {len(deduped_rows)} after de-duplication.")
+    if not verbose:
+        top = ", ".join(f"{r['function']} (comp {r['comp']})" for r in deduped_rows[:3])
+        print(f"  Top 3 ({label}): {top}")
+
+
+if __name__ == "__main__":
+    args = _parse_args()
+    rho_tag = "rhoTrue" if args.use_physical_scale else "rhoFalse"
+    comps = [int(c) for c in args.comps.split(",")]
+    min_points_list = [int(n) for n in args.min_points.split(",") if n.strip()]
+
+    rank_across_comps(args, rho_tag, comps)
+    for n in min_points_list:
+        rank_across_comps(args, rho_tag, comps, min_points=n, verbose=False)

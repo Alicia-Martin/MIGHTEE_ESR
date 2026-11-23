@@ -23,10 +23,12 @@ from esr.generation import simplifier
 
 from _top_functions import build_picks
 
-FN_DIR = os.environ.get("ESR_FUNCTION_LIBRARY_DIR", os.path.join(os.path.dirname(os.path.abspath(__file__)), "function_library", "core_maths"))
+# ESR function library: $ESR_FUNCTION_LIBRARY_DIR if set, else
+# <repo>/function_library/core_maths.
+FN_DIR = os.environ.get("ESR_FUNCTION_LIBRARY_DIR") or os.path.join(os.path.dirname(os.path.abspath(__file__)), "function_library", "core_maths")
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 GALAXY_FILE = os.path.join(BASE_DIR, "galaxy_names.txt")
-DATA_FILE = os.path.join(BASE_DIR, "ALL_gbar_gobs_RAR_direct_phot.txt")
+DATA_FILE = os.path.join(BASE_DIR, "ALL_gbar_gobs_RAR_direct_phot_with_5_arc_radius_plus_Halpha_for_ESR.txt")
 MAX_FUN_PARAM = 4
 # n_extra/max_param_total depend on use_physical_scale (rho0/rs only exist
 # in physical-scale mode -- match.py's own column layout, n_extra=2 if

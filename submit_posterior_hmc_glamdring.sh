@@ -83,13 +83,17 @@ fi
 # (meta.json is the source of truth both scripts actually read), just for a
 # human-readable, collision-free directory name.
 tag="comp${comp}_$(echo "$fcn_string" | sed -E 's/[^0-9a-zA-Z]+/_/g; s/^_+|_+$//g')"
+# FIT_ML=1: the run fitted f (an _fml run) -- sample f too; _fml folder so the
+# raw results of the run without f are never overwritten.
+fml_flag=""
+if [ "${FIT_ML:-0}" = "1" ]; then fml_flag="--fit-ml"; tag="${tag}_fml"; fi
 raw_dir="posterior_check_output/hmc_raw_${tag}"
 meta_path="${raw_dir}/meta.json"
 group_name="posterior_hmc_${tag}"
 
 echo "=== Stage 1/3: preparing shared meta (nshape, fallback anchors) ==="
 "$python_bin" prepare_posterior_hmc_meta.py --comp "$comp" --fcn-string "$fcn_string" \
-    --fn-library-dir "$fn_library_dir" --results-dir "$results_dir" --meta-out "$meta_path"
+    --fn-library-dir "$fn_library_dir" --results-dir "$results_dir" --meta-out "$meta_path" $fml_flag
 if [ $? -ne 0 ]; then
     echo "Error: prepare_posterior_hmc_meta.py failed -- not submitting any array jobs."
     exit 1
@@ -118,4 +122,4 @@ echo "    e.g. 'qstat -u \$USER' or your cluster's own job-status command),"
 echo "    run the merge step to produce the final PDF + summary: ==="
 echo
 echo "$python_bin merge_posterior_hmc.py --meta $meta_path --raw-dir $raw_dir \\"
-echo "    --out-dir posterior_check_output --fn-library-dir $fn_library_dir"
+echo "    --out-dir posterior_check_output --fn-library-dir $fn_library_dir --results-dir $results_dir"

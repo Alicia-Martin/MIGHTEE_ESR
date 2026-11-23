@@ -66,6 +66,17 @@
 # jobs aren't guaranteed to inherit the submitting shell's environment.
 #     ESR_FUNCTION_LIBRARY_DIR=/path/to/function_library/core_maths \
 #         COMP=5 bash submit_mightee_comp_glamdring.sh
+#
+# RUN_NAME sets the base run name (default "mightee"); outputs go to
+# fitting/output/output_<RUN_NAME>_<rhoTag>/. Use a new one to keep an
+# earlier run's results instead of overwriting them, e.g.:
+#     RUN_NAME=mightee_v2 COMP=5 bash submit_mightee_comp_glamdring.sh
+#
+# FIT_ML=1 also fits the stellar M/L factor f (run_esr_mightee.py's --fit-ml).
+# Needs RAR_MIGHTEE_total_ml_ratios_direct.txt next to the catalogue. Outputs go
+# to fitting/output/output_<RUN_NAME>_fml_<rhoTag>/, so they never mix with runs
+# without f; combine them with combine_all_galaxies.py --run-name <RUN_NAME>_fml.
+#     FIT_ML=1 COMP=6 bash submit_mightee_comp_glamdring.sh
 set -u
 
 comp="${COMP:-}"
@@ -92,7 +103,13 @@ else
     phys_flag="--no-physical-scale"
     rho_tag="rhoFalse"
 fi
-group_name="mightee_comp${comp}_${rho_tag}"
+run_name="${RUN_NAME:-mightee}"
+fit_ml="${FIT_ML:-0}"
+group_suffix=""
+if [ "$fit_ml" = "1" ] || [ "$fit_ml" = "true" ]; then
+    group_suffix="_fml"
+fi
+group_name="${run_name}${group_suffix}_comp${comp}_${rho_tag}"
 rerun="${RERUN:-0}"
 fn_library_dir="${ESR_FUNCTION_LIBRARY_DIR:-}"
 if [ -z "$fn_library_dir" ]; then
@@ -114,13 +131,19 @@ while IFS= read -r galaxy || [ -n "$galaxy" ]; do
     # Built as an array (never expanded empty under `set -u`) so --rerun is
     # appended only when requested, rather than risking an empty-string
     # argument reaching argparse when it's not.
-    py_args=(--galaxy "$galaxy" --comp "$comp" --run-name "mightee"
+    py_args=(--galaxy "$galaxy" --comp "$comp" --run-name "$run_name"
              --fn-library-dir "$fn_library_dir" "$phys_flag")
     if [ "$rerun" = "1" ] || [ "$rerun" = "true" ]; then
         py_args+=(--rerun)
+    fi
+    if [ -n "$group_suffix" ]; then
+        py_args+=(--fit-ml)
+    fi
+    if [ -n "${START_FROM:-}" ]; then
+        py_args+=(--start-from "$START_FROM")
     fi
     addqueue -q "$queue" -n "$n_cores" -m "$mem_gb" --group "$group_name" \
         "$python_bin" run_esr_mightee.py "${py_args[@]}"
 done < "$galaxy_names_file"
 
-echo "Submitted $gal_idx galaxy jobs at comp=$comp, use_physical_scale=$use_physical_scale, rerun=$rerun."
+echo "Submitted $gal_idx galaxy jobs at comp=$comp, run_name=$run_name, use_physical_scale=$use_physical_scale, rerun=$rerun."

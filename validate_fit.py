@@ -454,9 +454,8 @@ def validate_fit(
             straight through to optimise_fun_direct_nm (production default
             3000/3000). Raise these to check whether a gap is a budget
             problem (more evaluations would close it) or a genuine blind
-            spot (DIRECT plateaus regardless of budget) -- see the
-            the development notes, where 3000->100000 made no
-            difference for a0*pow(x,a1)/(a2+x).
+            spot (DIRECT plateaus regardless of budget); e.g.
+            3000->100000 makes no difference for a0*pow(x,a1)/(a2+x).
         landscape_grid_n: resolution (per axis) of the likelihood-landscape
             plot's NLL grids.
 
@@ -493,7 +492,7 @@ def validate_fit(
     diag = {}
     t0 = time.time()
     (_pipe_chi2_joint, pipe_full_params, _j_out, _count_lowest, _success,
-     pipe_inc, pipe_d, pipe_stage2_chi2, pipe_flag_reason) = optimise_fun_direct_nm(
+     pipe_inc, pipe_d, pipe_stage2_chi2, pipe_flag_reason, _f_fit) = optimise_fun_direct_nm(
         fcn_string, likelihood, tmax=90, pmin=pmin, pmax=pmax, log_opt=True,
         direct_maxfun=direct_maxfun, direct_maxiter=direct_maxiter,
         diagnostics_out=diag,
@@ -555,7 +554,7 @@ def validate_fit(
         # shape_fit (not the stale pre-polish nm_best["active_params"]) is
         # the self-consistent post-polish shape -- see galaxy_params_polish's
         # own docstring on why pairing new Inc/D with old shape is wrong.
-        shape_fit_nm, inc_nm, d_nm, stage2_nm = galaxy_params_polish(likelihood, eq_numpy, integrated, nm_best["active_params"])
+        shape_fit_nm, inc_nm, d_nm, stage2_nm, _ = galaxy_params_polish(likelihood, eq_numpy, integrated, nm_best["active_params"])
         arms[f"{n_random}x random Nelder-Mead"] = {
             "stage1_chi2": nm_best["stage1_chi2"], "active_params": shape_fit_nm,
             "inc_fit": inc_nm, "d_fit": d_nm, "stage2_chi2": stage2_nm, "wall_time": nm_wall,
@@ -580,7 +579,7 @@ def validate_fit(
     bfgs_best = _run_bfgs_arm(starts, obj_grad)
     bfgs_wall = time.time() - t0
     if bfgs_best is not None:
-        shape_fit_bfgs, inc_bfgs, d_bfgs, stage2_bfgs = galaxy_params_polish(likelihood, eq_numpy, integrated, bfgs_best["active_params"])
+        shape_fit_bfgs, inc_bfgs, d_bfgs, stage2_bfgs, _ = galaxy_params_polish(likelihood, eq_numpy, integrated, bfgs_best["active_params"])
         arms[f"{n_random}x random BFGS"] = {
             "stage1_chi2": bfgs_best["stage1_chi2"], "active_params": shape_fit_bfgs,
             "inc_fit": inc_bfgs, "d_fit": d_bfgs, "stage2_chi2": stage2_bfgs, "wall_time": bfgs_wall,
